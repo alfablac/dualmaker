@@ -1,0 +1,12 @@
+dualmaker contains a modified copy of titmilk/milksync.py.
+
+titmilk is a fork of milksync from The Cute Collection and is distributed
+under the GNU Affero General Public License, version 3 or later.
+
+Original copyright notice:
+Copyright (C) 2021 Anders Jensen
+
+Source used for this package:
+https://github.com/v3e1/titmilk
+Revision: 9758ed8 (Fix typo)
+

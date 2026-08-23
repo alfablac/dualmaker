@@ -1,0 +1,177 @@
+# Copy this file to ~/.dualmaker/config.yml, or run: dualmaker --init-config
+# Precedence: command line > DUALMAKER_* environment > this file > defaults.
+
+dualmaker:
+  recursive: false
+  tag: alfaHD
+  conflict: increment
+  dub_language: pt-BR
+  original_language: null
+  dual_audio_ids: []
+  normal_audio_ids: []
+  # Source-aware overrides use master:TRACK_ID or dual:TRACK_ID.
+  dub_track_selectors: []
+  original_track_selector: null
+  preferred_original_source: master
+  preferred_dub_source: dual
+  audio_codec_preference: [A_TRUEHD, DTS-HD MASTER AUDIO, DTS XLL, A_FLAC, A_EAC3, A_DTS, A_AC3, A_OPUS, A_AAC, A_MPEG/L3]
+  audio_selection_margin: 0.75
+  # Keep the master subtitle for an existing language/forced/SDH slot.
+  # Set exact-union only when every non-byte-identical source subtitle is wanted.
+  subtitle_policy: prefer-master
+  # DUAL-attached sidecars default to pt-BR; override individual files below.
+  sidecar_dual_language: pt-BR
+  sidecar_language_overrides: []
+  recap_window: 120.0
+  end_tolerance_ms: 500
+  dry_run: false
+  interactive: false
+  keep_temp: false
+
+paths:
+  output_dir_name: dualmaker-output
+  work_dir_name: .dualmaker-work
+  ignored_dir_names:
+    - dualmaker-output
+    - .dualmaker-work
+    - .git
+    - .venv
+    - .venv-ui
+    - .test-work
+    - .uv-cache
+  allowed_paths: []
+  required_paths: []
+  enforce_paths: false
+  # output_dir: /media/finished
+  # temp_dir: /media/releases/.dualmaker-work
+
+tools:
+  ffmpeg: ffmpeg
+  ffprobe: ffprobe
+  mediainfo: mediainfo
+  mkvmerge: mkvmerge
+  mkvextract: mkvextract
+  mkvpropedit: mkvpropedit
+  minimum_mkvmerge_version: 76
+
+security:
+  required_group: null
+  output_group: null
+
+features:
+  trim_recap: true
+  end_trim: true
+  reconcile_av: true
+  av_tolerance_ms: 200
+  allow_experimental_fps_sync: false
+  compatible_fps_pairs:
+    - 24000/1001=24/1
+    - 24000/1001=25/1
+    - 24/1=25/1
+    - 24/1=30/1
+    - 24000/1001=30000/1001
+    - 25/1=30000/1001
+  fps_max_drift_seconds: 0.5
+  fps_min_match_confidence: 0.38
+  fps_validation_positions: [0.10, 0.50, 0.90]
+  fps_search_radius_seconds: 30.0
+  fps_speed_ratio_tolerance: 0.0025
+  # Standard content-clock candidates; the common-original spectrogram must prove one.
+  fps_content_speed_factors: ["24/25", "24000/25025", "25/24", "25025/24000", "1000/1001", "1001/1000"]
+  fps_audio_duration_ratio_tolerance: 0.01
+  # Robust local acoustic slopes distinguish playback-speed drift from editorial cuts.
+  fps_spectral_tempo_probe: true
+  fps_spectral_min_pairs: 12
+  fps_spectral_pair_min_seconds: 20.0
+  fps_spectral_pair_max_seconds: 180.0
+  fps_spectral_max_dispersion: 0.015
+  fps_spectral_slope_cluster_radius: 0.003
+  fps_spectral_max_speed_adjustment: 0.08
+  # Optional multi-pass refinement remains disabled: DTW anchor selection can change
+  # after very small speed changes. Post-sync projected drift is still reported.
+  fps_spectral_max_projected_drift_seconds: 0.10
+  fps_spectral_max_refinement_passes: 2
+  fps_spectral_refinement_damping: 0.50
+  fps_spectral_iterative_refinement: false
+  # One video anchor is only enough after reliable pre- and post-sync acoustic proof.
+  fps_spectral_min_post_map_anchors: 1
+  # Whole-timeline fallback for broadcasts/cuts that displace the fixed FPS windows.
+  fps_adaptive_anchors: true
+  fps_anchor_sample_count: 15
+  fps_anchor_candidate_count: 6
+  fps_anchor_window_seconds: 8.0
+  fps_anchor_min_separation_seconds: 45.0
+  # A shorter affine run is treated as editorial segmentation, not a global FPS conversion.
+  fps_anchor_global_coverage: 0.55
+  # An already-proven segmented map may use two widely separated post-map video checks;
+  # ordinary/global FPS synchronization still requires beginning, middle, and end.
+  fps_segmented_min_post_map_anchors: 2
+  fps_segmented_min_post_map_span_seconds: 120.0
+  # Repair a verified master-only gap in an otherwise synchronized DUAL dub.
+  # original uses the master reference/original audio; silence keeps the gap; off disables it.
+  dub_gap_fallback: original
+  dub_gap_min_seconds: 1.0
+  dub_gap_min_coverage: 0.80
+  # Display name for a repaired Portuguese dub; diagnostics stay in the JSON report.
+  dub_gap_track_title: "Portuguese (Brazil)"
+  align_framerate: false
+  align_frames_too: false
+  only_delta: false
+  adjust_delay: null
+  preserve_silence: false
+
+tvrip:
+  # Experimental and opt-in. Interactive mode still reviews every segment.
+  allow_tvrip_segment_sync: false
+  tvrip_min_source_match_confidence: 0.55
+  tvrip_min_segment_confidence: 0.35
+  # Lower visual thresholds used only after both acoustic tempo checks are reliable.
+  tvrip_spectral_min_segment_confidence: 0.25
+  tvrip_spectral_min_source_match_confidence: 0.25
+  tvrip_max_residual_seconds: 0.4
+  tvrip_min_coverage: 0.85
+  # Review warning threshold only. A cut-heavy source can legitimately exceed
+  # it; dualmaker still assembles every mapped interval and records the count.
+  tvrip_max_segments: 24
+  # With explicit TVRip opt-in, record validation concerns but still create the
+  # renderable output. Set false to restore strict unattended rejection.
+  tvrip_continue_on_validation_warnings: true
+  tvrip_min_segment_seconds: 8.0
+  tvrip_max_segment_seconds: 300.0
+  tvrip_break_sensitivity_seconds: 0.75
+  tvrip_commercial_min_seconds: 12.0
+  tvrip_retain_alternative_sections: false
+  tvrip_fallback: ask # ask, original, alternate-dub, silence, or omit
+  tvrip_allow_speed_correction: true
+  tvrip_max_speed_adjustment: 0.05
+  tvrip_require_interactive_approval: false
+  tvrip_allow_partial_tracks: true
+  tvrip_validation_positions: [0.08, 0.50, 0.92]
+  tvrip_validation_window_seconds: 3.0
+  tvrip_validation_search_seconds: 2.0
+  # When the explicit telecine fallback accepts an audio map despite visual mismatch,
+  # audit every mapped bucket with the common original before retaining its dub.
+  tvrip_acoustic_segment_validation: true
+  # Each probe compares this many seconds of common-original audio.
+  tvrip_acoustic_segment_window_seconds: 5.0
+  tvrip_acoustic_segment_min_seconds: 2.0
+  # Insert extra probes so no mapped interval has a larger unchecked gap.
+  # Lower values are stricter but make more short FFmpeg comparisons.
+  tvrip_acoustic_segment_max_gap_seconds: 30.0
+  # Use master fallback for this safety margin before and after a failed probe.
+  tvrip_acoustic_segment_rejection_padding_seconds: 5.0
+  tvrip_acoustic_segment_min_similarity: 0.60
+  # Do not retain a mapped dub interval when local reference audio cannot prove
+  # it belongs to the master. The decision is local; matching silence remains
+  # mapped because there is no audible material to replace. Set false only for
+  # manual recovery of very short ambiguous intervals.
+  tvrip_acoustic_segment_require_proof: true
+  # Display name for a synchronized TVRip dub; diagnostics stay in the JSON report.
+  tvrip_track_title: "Portuguese (Brazil)"
+
+interface:
+  output_format: rich
+  color: auto
+  progress: true
+  quiet: false
+  verbose: false

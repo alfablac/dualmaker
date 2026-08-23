@@ -1,0 +1,4 @@
+include dualmaker.example.toml
+include dualmaker.example.yml
+recursive-include docs *.md
+prune .uv-cache
