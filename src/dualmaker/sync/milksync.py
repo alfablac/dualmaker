@@ -1,4 +1,4 @@
-# Modified for dualmaker from titmilk revision 9758ed8.
+# Modified for dualmaker from milksync revision 9758ed8.
 # Copyright (C) 2021 Anders Jensen. AGPL-3.0-or-later; see LICENSE and NOTICE.
 import concurrent.futures
 import json
@@ -33,7 +33,7 @@ from ..defaults import DEFAULT_WORK_DIR_NAME
 
 fmt = '%(message)s'
 logging.basicConfig(level=logging.INFO, format=fmt)
-logger = logging.getLogger('titmilk')
+logger = logging.getLogger('milksync')
 
 # HOP_LENGTH = 1024
 # HOP_LENGTH = 512

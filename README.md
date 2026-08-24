@@ -9,7 +9,7 @@ Documentação completa em português do Brasil: [Como o dualmaker funciona](doc
 
 The normal release remains the master for video, chapters, tags, and naming. Audio is selected
 independently by quality: the preferred original may come from either release, while every
-retained source-side dub is synchronized with the master using the bundled `titmilk`/`milksync`
+retained source-side dub is synchronized with the master using the bundled `milksync`
 engine. Source files are never changed.
 
 ## Requirements
@@ -450,5 +450,5 @@ The public data models include `MediaAsset`, `Track`, `Attachment`, `ContentIden
 ## License and attribution
 
 dualmaker is distributed under the GNU Affero General Public License, version 3 or later. It
-contains a modified copy of `titmilk/milksync.py`, itself derived from The Cute Collection's
+contains a modified copy of `milksync.py`, itself derived from The Cute Collection's
 milksync implementation. See `LICENSE` and `NOTICE`.

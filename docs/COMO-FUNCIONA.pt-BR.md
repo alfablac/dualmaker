@@ -439,4 +439,4 @@ Sidecars externos precisam estar associados ao nome de um dos MKVs. A primeira v
 
 ## Licença e atribuição
 
-O pacote é distribuído sob AGPL-3.0-or-later. A implementação de sincronização mantém a atribuição ao projeto titmilk/Milksync e inclui os samples de silêncio necessários dentro do pacote, conforme os arquivos de licença e aviso na raiz do projeto.
+O pacote é distribuído sob AGPL-3.0-or-later. A implementação de sincronização mantém a atribuição ao projeto Milksync e inclui os samples de silêncio necessários dentro do pacote, conforme os arquivos de licença e aviso na raiz do projeto.
