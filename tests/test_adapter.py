@@ -56,7 +56,7 @@ class FakeRunner:
 
 
 class SpectralSlopeRunner(FakeRunner):
-    """Report a corrected correspondence map in Milksync's source clock."""
+    """Report the residual slope of Milksync's rendered waveform."""
 
     def __init__(self, factor: float) -> None:
         super().__init__()
@@ -67,8 +67,11 @@ class SpectralSlopeRunner(FakeRunner):
         output = Path(self.command[self.command.index("--output") + 1])
         report = Path(self.command[self.command.index("--sync-report") + 1])
         output.touch()
+        reported_factor = (
+            1.0 if "--framerate-speed-factor" in self.command else self.factor
+        )
         points = [
-            [source / self.factor, source, source / self.factor - source]
+            [source / reported_factor, source, source / reported_factor - source]
             for source in range(0, 201, 20)
         ]
         report.write_text(
@@ -100,12 +103,14 @@ class TelecineLinearDriftRunner(FakeRunner):
         output = Path(self.command[self.command.index("--output") + 1])
         report = Path(self.command[self.command.index("--sync-report") + 1])
         output.touch()
-        # Chroma is rendered with atempo, but the saved anchor coordinates are
-        # converted back to source packet time. A corrected run therefore
-        # repeats the requested factor; adapter code compares it to that
-        # factor before deciding whether another render is needed.
+        # The first pass exposes the source clock. Once atempo is requested,
+        # Milksync measures the already-rendered waveform and reports a unit
+        # residual.
+        reported_factor = (
+            1.0 if "--framerate-speed-factor" in self.command else self.factor
+        )
         points = [
-            [source / self.factor, source, source / self.factor - source]
+            [source / reported_factor, source, source / reported_factor - source]
             for source in range(0, 1201, 20)
         ]
         report.write_text(
@@ -124,16 +129,16 @@ class TelecineLinearDriftRunner(FakeRunner):
 
 
 class AdapterMappingTests(unittest.TestCase):
-    def test_post_sync_speed_is_normalized_to_the_requested_tempo(self) -> None:
-        # Milksync serializes its final correspondence in source packet time,
-        # so the applied tempo must be divided out to measure the residual.
+    def test_post_sync_speed_is_measured_on_the_rendered_timeline(self) -> None:
+        # Milksync measures chroma after atempo, so a corrected render has a
+        # unit post-render residual regardless of the tempo used to make it.
         self.assertAlmostEqual(
-            post_sync_relative_speed(0.9780320280189394, 0.9780320280189394) or 0,
+            post_sync_relative_speed(1.0, 0.9780320280189394) or 0,
             1.0,
         )
         self.assertAlmostEqual(
             post_sync_relative_speed(0.96, 0.9780320280189394) or 0,
-            0.96 / 0.9780320280189394,
+            0.96,
             places=10,
         )
 

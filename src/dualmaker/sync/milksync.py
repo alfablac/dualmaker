@@ -1182,6 +1182,11 @@ def extract_and_sync_audio(
         audio_stream['channel_layout'] = 'stereo'
     audio_file_list = []
     segment_id = 1
+    # Differences below one AAC/FLAC frame are numerical noise from the
+    # rounded DTW anchors, not audible timeline gaps. Trying to render them as
+    # standalone lavfi silence files makes ffmpeg reject durations such as
+    # 80 microseconds (exit 234) during a rerender.
+    timeline_epsilon = 0.005
     # Place each source bucket by its absolute mapped target timestamp.  A
     # delta change in the middle normally accompanies a source gap that has
     # already removed a commercial/edit. Applying that change again as a
@@ -1238,7 +1243,7 @@ def extract_and_sync_audio(
         target_start = t1 + delta
         timeline_gap = target_start - output_cursor
 
-        if timeline_gap > 0.000_001:
+        if timeline_gap > timeline_epsilon:
             logger.info(
                 f"Adding {timeline_gap=} to place source bucket at "
                 f"{target_start=} from {t1=}"
@@ -1308,7 +1313,7 @@ def extract_and_sync_audio(
                 stderr=subprocess.DEVNULL,
             )
             output_cursor += timeline_gap
-        elif timeline_gap < -0.000_001:
+        elif timeline_gap < -timeline_epsilon:
             overlap = -timeline_gap
             logger.info(
                 f"Removing {overlap=} overlap to place source bucket at "

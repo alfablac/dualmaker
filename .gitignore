@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.venv/
+.venv-ui/
+.wheel-smoke-venv/
+.test-work/
+.dualmaker-work/
+.uv-cache/
+.ruff-cache-local/
+.build-artifacts/
+build/
+dist/
+dualmaker-output/

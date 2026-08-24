@@ -117,18 +117,16 @@ def post_sync_relative_speed(
 ) -> float | None:
     """Return the residual clock slope after the requested tempo is applied.
 
-    Milksync computes chroma from the atempo-rendered waveform, but serializes
-    its correspondence points back in the source packet clock.  Therefore a
-    corrected run reports the requested source factor again, not ``1.0``.
-    Dividing the measured factor by the applied factor expresses the remaining
-    error on the rendered timeline.  Treating the raw measurement as a
-    residual would cancel a valid slow-down and make Milksync insert hundreds
-    of tiny silence gaps to make up the resulting duration difference.
+    Milksync measures the correspondence after ``atempo`` has rendered the
+    source waveform. Its measured factor is therefore already the residual on
+    the rendered timeline: a successful corrected pass reports ``1.0``.
+    Dividing it by the requested factor created a fictitious residual (for
+    example, ``1 / 0.9855``) and could trigger a second, wrong clock change.
     """
 
     if observed_speed_factor is None or applied_speed_factor <= 0:
         return None
-    return observed_speed_factor / applied_speed_factor
+    return observed_speed_factor
 
 
 def next_spectral_speed_factor(
@@ -560,58 +558,23 @@ class MilksyncAdapter:
                 > max(config.fps_speed_ratio_tolerance, 0.003)
             ):
                 measured_factor = float(observed_speed_factor)
-                candidate_factor = measured_factor
-                duration_evidence = plan.fps.validation.get(
-                    "audio_duration_evidence", {}
-                )
-                nominated = (
-                    duration_evidence.get("nominated", [])
-                    if isinstance(duration_evidence, dict)
-                    else []
-                )
-                duration_factor = (
-                    float(nominated[0]["configured_ratio"] .split("/")[0])
-                    / float(nominated[0]["configured_ratio"].split("/")[1])
-                    if nominated
-                    and isinstance(nominated[0], dict)
-                    and isinstance(nominated[0].get("configured_ratio"), str)
-                    and "/" in nominated[0]["configured_ratio"]
-                    else None
-                )
-                if (
-                    duration_factor is not None
-                    and abs(measured_factor - duration_factor)
-                    > config.fps_audio_duration_ratio_tolerance
-                ):
-                    # Local DTW slopes can form a stable but wrong cluster
-                    # around edit boundaries. A standard content-speed ratio
-                    # supported by the independent duration measurement is a
-                    # safer clock for rendering than that local intercept.
-                    candidate_factor = duration_factor
-                    residual["duration_clock_override"] = True
-                    residual["local_speed_factor"] = measured_factor
-                    residual["duration_speed_factor"] = duration_factor
                 maximum_adjustment = min(
                     config.fps_spectral_max_speed_adjustment,
                     config.tvrip_max_speed_adjustment,
                 )
-                if abs(candidate_factor - 1.0) <= maximum_adjustment:
+                if abs(measured_factor - 1.0) <= maximum_adjustment:
                     refinement_history.append(
                         {
                             "render_pass": render_pass,
                             "previous_speed_factor": 1.0,
                             "residual_speed_factor": relative_speed_factor,
                             "projected_drift_seconds": float(projected_drift or 0.0),
-                            "refined_speed_factor": candidate_factor,
-                            "correction_method": (
-                                "duration-ratio-clock-rescue"
-                                if candidate_factor != measured_factor
-                                else "post-map-linear-drift-rescue"
-                            ),
+                            "refined_speed_factor": measured_factor,
+                            "correction_method": "post-map-linear-drift-rescue",
                         }
                     )
-                    plan.fps.proposed_speed_factor = candidate_factor
-                    plan.fps.detected_speed_factor = candidate_factor
+                    plan.fps.proposed_speed_factor = measured_factor
+                    plan.fps.detected_speed_factor = measured_factor
                     plan.fps.apply_speed_correction = True
                     residual["linear_drift_rescue"] = True
                     plan.fps.reason = (
