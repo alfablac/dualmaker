@@ -289,7 +289,7 @@ def process_job(
                 )
             ):
                 raise AmbiguousPairError(
-                    "Opening audio does not align and no unique recap boundary was validated"
+                    "Opening audio does not align and no unique recap boundary was validated. Try with --no-trim-recap or --interactive to select a candidate trim, or verify the source files are correct."
                 )
             plan.normal_trim = decision.normal_trim
             plan.dual_trim = decision.dual_trim
