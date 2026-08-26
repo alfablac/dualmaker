@@ -4,7 +4,7 @@ import logging
 import math
 import shutil
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,7 +25,7 @@ from .matching import (
     require_explicit_tvrip_pair,
 )
 from .metadata import MediaInspector
-from .models import DualMakerConfig, JobPlan, JobResult, MediaAsset, jsonable
+from .models import DualMakerConfig, JobPlan, JobResult, MediaAsset, PairCandidate, jsonable
 from .mux import mux_output
 from .planning import create_job_plan
 from .preprocess import RecapDecision, choose_recap_trim
@@ -764,7 +764,35 @@ def plan_batch(
             else:
                 candidates.append(options[0])
 
+    return plan_candidates(
+        config,
+        candidates,
+        candidate_languages=candidate_languages,
+        assets=assets,
+        skipped=skipped,
+    )
+
+
+def plan_candidates(
+    config: DualMakerConfig,
+    candidates: Iterable[PairCandidate],
+    *,
+    candidate_languages: Mapping[tuple[object, ...], str] | None = None,
+    assets: list[MediaAsset] | None = None,
+    skipped: list[str] | None = None,
+) -> tuple[list[JobPlan], list[str], list[MediaAsset]]:
+    """Turn explicitly selected match candidates into executable job plans.
+
+    The terminal TUI, desktop GUI, and future integrations can all share this
+    boundary: discovery and selection happen in the front end, while planning
+    and all media policy remain in the pipeline.
+    """
+
     plans: list[JobPlan] = []
+    skipped = list(skipped or [])
+    candidate_languages = candidate_languages or {}
+    candidates = list(candidates)
+    root = config.path.expanduser().resolve()
     default_output_root = config.output_dir or root / config.output_dir_name
     for candidate in candidates:
         try:
@@ -782,7 +810,7 @@ def plan_batch(
             plans.append(create_job_plan(candidate, job_config, sidecar_subtitles=sidecars))
         except (DualMakerError, ValueError) as exc:
             skipped.append(f"{candidate.identity.key}: {exc}")
-    return plans, skipped, assets
+    return plans, skipped, assets if assets is not None else []
 
 
 def plan_explicit(

@@ -52,6 +52,9 @@ python -m venv .venv
 python -m pip install -e '.[dev]'
 ```
 
+The equivalent dependency files are `requirements.txt` for runtime use and
+`requirements-dev.txt` for runtime plus test/lint tooling.
+
 The large Atmos and DTS-HD silence samples required by milksync are installed as package data.
 FFmpeg, MediaInfo, and MKVToolNix remain system dependencies so the package is not tied to a
 specific Linux distribution or CPU architecture.
@@ -71,6 +74,21 @@ language before anything is processed. It provides **Back**, **Cancel**, and **C
 Ambiguous original languages, equivalent audio tracks, recap cuts, and experimental frame-rate
 approval use radio-button or explicit action dialogs rather than free-form text. Escape or `q`
 cancels safely; cancellation exits 130 and does not start another job.
+
+For a desktop workflow on Linux, macOS, or Windows, install the same package and run
+`dualmaker-gui`. It uses the platform's Tk desktop toolkit and the same discovery, matching,
+planning, and processing pipeline as `dualmaker`:
+
+```console
+dualmaker-gui /media/releases
+dualmaker-gui --config ~/.dualmaker/config.yml
+```
+
+The GUI scans folders in the background, displays every scored candidate (including alternatives
+that the automatic CLI mode would call ambiguous), lets you select one candidate per title, and
+supports manually adding an explicit master/DUAL pair. `?` buttons explain the common settings;
+the full configuration remains available in YAML/TOML. On Debian/Ubuntu, install `python3-tk` if
+your Python distribution does not include Tk.
 
 For scripts and service wrappers, use `--json`. Standard output then contains exactly one JSON
 document with the status, exit code, report path, concise results, and skipped items. Tool output
