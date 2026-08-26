@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-import grp
 import os
 import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+try:
+    import grp
+except ImportError:  # pragma: no cover - Windows test runner
+    grp = None
 
 from dualmaker.configuration import (
     CONFIG_SETTING_COMMENTS,
@@ -347,6 +352,8 @@ color = "never"
                 validate_configuration(config)
 
     def test_current_group_can_be_required(self) -> None:
+        if grp is None:
+            self.skipTest("POSIX groups are unavailable")
         current_group = grp.getgrgid(os.getegid()).gr_name
         config = load_configuration(
             {
@@ -360,12 +367,32 @@ color = "never"
         validate_configuration(config)
 
     def test_output_group_is_applied_to_staged_file(self) -> None:
+        if grp is None:
+            self.skipTest("POSIX groups are unavailable")
         current_group = grp.getgrgid(os.getegid()).gr_name
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "output.mkv"
             output.write_bytes(b"staged")
             _set_output_group(output, current_group)
             self.assertEqual(output.stat().st_gid, os.getegid())
+
+    def test_windows_without_grp_reports_group_settings_without_import_failure(self) -> None:
+        config = load_configuration(
+            {"path": Path.cwd(), "required_group": "media", "output_group": "media"},
+            environment={},
+            cwd=Path.cwd(),
+        )
+        with patch("dualmaker.configuration.grp", None), self.assertRaisesRegex(
+            ConfigurationError, "POSIX groups"
+        ):
+            validate_configuration(config)
+
+    def test_windows_profile_is_used_for_user_config(self) -> None:
+        profile = Path(tempfile.gettempdir()) / "dualmaker-windows-profile"
+        self.assertEqual(
+            default_user_config_path({"USERPROFILE": str(profile)}),
+            profile / ".dualmaker" / "config.yml",
+        )
 
 
 if __name__ == "__main__":

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import grp
 import os
 import shutil
 import textwrap
@@ -15,6 +14,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+try:  # ``grp`` is POSIX-only and is not present in the Windows stdlib.
+    import grp
+except ImportError:  # pragma: no cover - exercised on Windows
+    grp = None  # type: ignore[assignment]
 
 from .defaults import (
     BINARY_NAMES,
@@ -373,7 +377,12 @@ def default_user_config_path(environment: Mapping[str, str] | None = None) -> Pa
     configured_home = environment.get(CONFIG_HOME_ENV)
     if configured_home:
         return Path(configured_home).expanduser().resolve() / "config.yml"
-    home = Path(environment.get("HOME", str(Path.home()))).expanduser().resolve()
+    # HOME is conventional on Unix; USERPROFILE is the native Windows
+    # equivalent.  Path.home() remains the final fallback for embedded Python
+    # distributions and test environments that provide neither variable.
+    home = Path(
+        environment.get("HOME") or environment.get("USERPROFILE") or str(Path.home())
+    ).expanduser().resolve()
     return home / USER_CONFIG_RELATIVE
 
 
@@ -716,7 +725,9 @@ def _find_config_path(
     user = default_user_config_path(environment)
     if user.is_file():
         return user.resolve(), False
-    home = Path(environment.get("HOME", str(Path.home()))).expanduser().resolve()
+    home = Path(
+        environment.get("HOME") or environment.get("USERPROFILE") or str(Path.home())
+    ).expanduser().resolve()
     legacy_user = home / LEGACY_USER_CONFIG_RELATIVE
     if legacy_user.is_file():
         return legacy_user.resolve(), False
@@ -1090,20 +1101,28 @@ def validate_configuration(
             if not _inside(path, allowed):
                 problems.append(f"path is outside configured allowed_paths: {path.resolve()}")
 
-    current_groups = {os.getgid(), os.getegid(), *os.getgroups()}
-    for setting_name, group_name in (
+    configured_groups = (
         ("required_group", config.required_group),
         ("output_group", config.output_group),
-    ):
-        if not group_name:
-            continue
-        try:
-            configured_group = grp.getgrnam(group_name)
-        except KeyError:
-            problems.append(f"{setting_name} does not exist: {group_name}")
-        else:
-            if configured_group.gr_gid not in current_groups:
-                problems.append(f"current user is not a member of {setting_name} {group_name!r}")
+    )
+    if grp is None:
+        for setting_name, group_name in configured_groups:
+            if group_name:
+                problems.append(
+                    f"{setting_name} is only supported on operating systems with POSIX groups"
+                )
+    else:
+        current_groups = {os.getgid(), os.getegid(), *os.getgroups()}
+        for setting_name, group_name in configured_groups:
+            if not group_name:
+                continue
+            try:
+                configured_group = grp.getgrnam(group_name)
+            except KeyError:
+                problems.append(f"{setting_name} does not exist: {group_name}")
+            else:
+                if configured_group.gr_gid not in current_groups:
+                    problems.append(f"current user is not a member of {setting_name} {group_name!r}")
 
     if validate_binaries:
         for name, configured in config.binaries.items():

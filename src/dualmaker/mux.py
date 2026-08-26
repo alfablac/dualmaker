@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import grp
 import hashlib
 import logging
 import os
@@ -19,6 +18,11 @@ from .naming import choose_conflict_path
 from .ordering import preferred_portuguese_forced, subtitle_presentation_key, subtitle_sort_key
 from .runner import ToolRunner
 from .sync.adapter import SyncResult
+
+try:  # ``grp`` is POSIX-only and is not present in the Windows stdlib.
+    import grp
+except ImportError:  # pragma: no cover - exercised on Windows
+    grp = None  # type: ignore[assignment]
 
 LOGGER = logging.getLogger("dualmaker")
 
@@ -569,6 +573,10 @@ def _set_output_group(path: Path, group_name: str | None) -> None:
 
     if not group_name:
         return
+    if grp is None:
+        raise ProcessingError(
+            "output_group is only supported on operating systems with POSIX groups"
+        )
     try:
         group_id = grp.getgrnam(group_name).gr_gid
     except KeyError as exc:
