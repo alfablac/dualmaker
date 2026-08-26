@@ -1,6 +1,6 @@
 # Como o dualmaker funciona
 
-O dualmaker cria um MKV com o vídeo de um lançamento e o áudio dublado em português de outro lançamento. O caso mais comum é combinar um arquivo que tem áudio original e português com um arquivo que tem uma versão melhor do vídeo e apenas o áudio original.
+O dualmaker cria um MKV com o vídeo de um lançamento e o áudio dublado em português de outro lançamento. O caso mais comum é combinar um arquivo que tem áudio original e português com um arquivo que tem uma versão melhor do vídeo e apenas o áudio original. Uma fonte AVI legada só com o dub também é aceita: ela é remuxada por cópia de stream para um MKV temporário, sem modificar o AVI.
 
 Exemplo:
 
@@ -16,9 +16,15 @@ O primeiro arquivo é a fonte DUAL. O segundo é o master. O vídeo, os capítul
 O programa trata cada arquivo como uma coleção de faixas, e não como um nome de arquivo com uma extensão. A palavra `DUAL` no nome ajuda na descoberta, mas não decide sozinha o papel do arquivo. A decisão usa principalmente a topologia dos áudios:
 
 - a fonte DUAL precisa ter um áudio de programa em português;
-- ela também precisa ter um idioma original não português;
-- o master precisa conter uma faixa do idioma original compartilhado;
+- normalmente ela também tem um idioma original não português compartilhado com o master;
+- sem esse idioma compartilhado, a fonte entra no modo experimental de eventos sonoros entre idiomas;
 - faixas de comentário não entram como dublagem de programa.
+
+Um AVI com uma única faixa de programa sem idioma recebe por inferência o idioma de dub configurado
+(`pt-BR` por padrão). Um AVI com várias faixas sem idioma não é adivinhado: escolha a faixa
+explicitamente. Em uma dupla explícita com `--dual` e `--normal`, títulos de série traduzidos são
+aceitos se temporada e todos os números de episódio coincidirem; assim `Mulher.Bionica.S01E01.avi`
+pode ser usado com `The.Bionic.Woman.S01E01…mkv`.
 
 Em uma operação normal, o master é a linha do tempo de vídeo. O dualmaker calcula como a linha do tempo da fonte DUAL se relaciona com ela e aplica o mesmo mapa às dublagens e às legendas que forem importadas.
 
@@ -28,12 +34,12 @@ Uma execução passa por estas fases:
 
 1. resolve a configuração;
 2. verifica dependências, permissões e caminhos;
-3. inspeciona os MKVs com MediaInfo, `mkvmerge -J` e `ffprobe`;
+3. inspeciona MKVs com MediaInfo, `mkvmerge -J` e `ffprobe`, e AVIs com MediaInfo e `ffprobe`;
 4. identifica filmes, séries, temporadas e episódios;
 5. encontra pares DUAL e master;
 6. escolhe os áudios originais, dublados e as legendas;
 7. detecta recaps e outros cortes de abertura quando a opção está ativa;
-8. sincroniza os áudios comuns com Milksync;
+8. sincroniza os áudios comuns com Milksync ou, numa fonte só com dub, os eventos sonoros fortes;
 9. aplica o mapa de sincronização às faixas importadas;
 10. trata diferenças de FPS ou de edição quando o modo experimental foi autorizado;
 11. monta o novo MKV com `mkvmerge`;
@@ -159,6 +165,54 @@ O mesmo mapa é usado para:
 - PGS e VobSub quando a estratégia de timestamps permite;
 - ajustes de linha do tempo aplicados ao áudio original.
 
+### Ressincronização experimental do dub da fonte DUAL
+
+`experimental_dub_resync` vem ativado por padrão. Ele importa a faixa portuguesa escolhida da
+fonte DUAL, mesmo quando ela tem vídeo inferior, para o vídeo da fonte master. Quando há original
+comum, ele é a referência acústica normal. Quando a fonte só tem português, o Milksync usa janelas
+curtas de energia/onset e conserva apenas correspondências fortes de música, impactos, transições,
+tiros, portas e passos. Não trata diálogo português e inglês como uma correspondência linguística.
+Um mapa estacionário vira um atraso/adiantamento constante; mudanças entre trechos viram buckets
+separados de correção. Se os FPS forem diferentes, o fluxo experimental de FPS continua exigindo
+`--allow-experimental-fps-sync`.
+
+O relatório JSON inclui `experimental_dub_resync`, com fonte e master escolhidos, âncoras acústicas,
+faixa de offsets, segmentos de correção, cobertura, confirmação visual quando disponível e a
+confiança calculada. No modo só com dub, ele registra `alignment_mode:
+cross-language-events` e usa essas janelas curtas desde o início. O padrão
+`experimental_dub_resync_min_confidence: 0.80` sinaliza um mapa esparso para revisão, sem inventar
+âncoras a partir de diálogo. Desative com
+`--no-experimental-dub-resync` (ou `experimental_dub_resync: false`) e ajuste o limite com
+`--experimental-dub-resync-min-confidence`.
+
+Quando uma fonte só com dub também tem FPS diferente, o dualmaker mede o relógio bruto usando esses
+eventos antes da renderização. Para isso aceita quatro pares de eventos bem separados (em vez da
+quantidade maior exigida por áudio no mesmo idioma), tolera mais variação de mix e limita por padrão
+a correção a 10%; 25 fps para 23,976 fps pede 4,27%. Depois de renderizar, o mapa de eventos recebe
+uma única correção adicional se ainda indicar drift linear. Se só o começo estiver ruim e trechos
+posteriores estiverem bons, também pode existir uma abertura/recap diferente: nesse modo o programa
+não corta a abertura, pois diálogo traduzido não prova com segurança a fronteira do corte.
+
+### Limites de recursos do Milksync
+
+O Milksync executa análise numérica de CQT/DTW e suas bibliotecas nativas poderiam criar pools de
+threads para todos os núcleos disponíveis. Por padrão, o dualmaker limita esses pools a duas
+threads, usa um extrator de chroma por vez e fatia a matriz DTW em 25.000.000 de células. Isso evita
+centenas de threads ociosas e mapas grandes de memória virtual ao processar temporadas. Limites
+menores trocam velocidade por uso mais previsível de recursos:
+
+```console
+dualmaker /media/releases \
+  --milksync-max-threads 1 \
+  --milksync-chroma-workers 1 \
+  --milksync-max-cost-matrix-cells 8000000
+```
+
+No arquivo de configuração, use `milksync_max_threads`, `milksync_chroma_workers` e
+`milksync_max_cost_matrix_cells` em `features`. As variáveis de ambiente equivalentes são
+`DUALMAKER_MILKSYNC_MAX_THREADS`, `DUALMAKER_MILKSYNC_CHROMA_WORKERS` e
+`DUALMAKER_MILKSYNC_MAX_COST_MATRIX_CELLS`.
+
 Os controles avançados `--align-framerate`, `--align-frames-too`, `--only-delta`,
 `--adjust-delay` e `--preserve-silence` ficam separados do fluxo padrão. Eles são úteis para
 diagnóstico ou para uma fonte conhecida, mas não substituem a validação automática. `--adjust-delay`
@@ -197,7 +251,7 @@ dualmaker /media/releases \
 
 O fluxo experimental tenta, nesta ordem, relações de tempo e conteúdo que podem ser comprovadas. Ele usa âncoras de áudio, janelas espectrais e, quando disponível, um mapa segmentado de vídeo. Não altera a velocidade só porque o container informa FPS diferente.
 
-Em uma conversão 29,97 para 23,976, o modo pode reconhecer uma relação de telecine. Nesse caso, o áudio continua em tempo real e a validação passa para o mapa acústico e para os segmentos. O programa aceita uma confirmação de vídeo pós-sincronização quando a prova espectral antes e depois é confiável. Um conjunto fraco de âncoras visuais ainda causa rejeição.
+Em uma conversão 29,97 para 23,976, o modo pode reconhecer uma relação de telecine. Nesse caso, o áudio continua em tempo real e a validação passa para o mapa acústico e para os segmentos. O programa aceita uma confirmação de vídeo pós-sincronização quando a prova espectral antes e depois é confiável. Um conjunto fraco de âncoras visuais fica registrado como aviso no JSON, com os pontos e o erro medido, mas o dualmaker mantém o melhor mapa disponível para revisão manual.
 
 ## TVRip e fontes com cortes editoriais
 
@@ -433,7 +487,7 @@ Os modelos públicos incluem `MediaAsset`, `Track`, `PairCandidate`, `JobPlan`, 
 
 O vídeo do master é preservado por cópia de stream. O dualmaker não tenta editar o vídeo para inserir cenas exclusivas da TVRip. Por isso, material somente da transmissão pode ser removido do áudio e das legendas, mas não aparece magicamente no vídeo final.
 
-Fontes com FPS diferente, cortes complexos, VobSub com vários atrasos e mapas com pouca evidência continuam sendo casos experimentais. O programa prefere pular ou pedir revisão a publicar um arquivo cuja sincronização não possa ser justificada pelo relatório.
+Fontes com FPS diferente, cortes complexos, VobSub com vários atrasos e mapas com pouca evidência continuam sendo casos experimentais. Quando as tentativas de âncoras não forem conclusivas, o programa registra um aviso e todas as evidências no relatório, mantém a melhor hipótese disponível e produz um arquivo para revisão manual em vez de abortar a tentativa.
 
 Sidecars externos precisam estar associados ao nome de um dos MKVs. A primeira versão não busca legendas soltas sem relação clara com a dupla.
 

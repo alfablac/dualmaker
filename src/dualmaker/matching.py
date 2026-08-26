@@ -56,6 +56,26 @@ def _has_portuguese(asset: MediaAsset) -> bool:
     )
 
 
+def infer_untagged_avi_dub_language(asset: MediaAsset, language: str) -> bool:
+    """Infer the configured dub language for a one-track legacy AVI.
+
+    AVI does not carry dependable language tags.  Restrict inference to a
+    single program audio stream with no language tag; multi-track files remain
+    unmodified so an operator can identify the intended track explicitly.
+    """
+
+    if asset.path.suffix.lower() != ".avi":
+        return False
+    program_audio = [track for track in asset.audio_tracks if not track.commentary]
+    if len(program_audio) != 1 or normalize_language(program_audio[0].effective_language) != "und":
+        return False
+    inferred = normalize_language(language)
+    program_audio[0].language = inferred
+    program_audio[0].language_ietf = inferred
+    program_audio[0].properties["language_inferred_from_avi"] = True
+    return True
+
+
 def _looks_generated(
     path: Path,
     *,
@@ -77,7 +97,7 @@ def discover_mkvs(
     ignored_paths: tuple[Path, ...] = (),
     tag: str = DEFAULT_TAG,
 ) -> list[Path]:
-    """Return eligible Matroska inputs without guessing from release-group names.
+    """Return eligible Matroska and legacy AVI inputs without filename guessing.
 
     Generated files live in configured output/work directories, which are reliable
     boundaries.  A ``.DUAL-<tag>`` suffix is *not* a safe generated-file marker:
@@ -91,12 +111,13 @@ def discover_mkvs(
     root = path.expanduser().resolve()
     if not root.is_dir():
         raise PairingError(f"Scan path is not a directory: {root}")
-    iterator = root.rglob("*.mkv") if recursive else root.glob("*.mkv")
+    iterator = root.rglob("*") if recursive else root.iterdir()
     return sorted(
         (
             item
             for item in iterator
             if item.is_file()
+            and item.suffix.lower() in {".mkv", ".avi"}
             and not _looks_generated(
                 item,
                 ignored_dir_names=ignored_dir_names,
@@ -145,29 +166,80 @@ def _shared_originals(normal: MediaAsset, dual: MediaAsset) -> tuple[str, ...]:
     return tuple(sorted(lang for lang in shared if lang != "pt"))
 
 
+def _alignment_mode(shared_originals: tuple[str, ...]) -> str:
+    """Choose the acoustic evidence available for a candidate pair.
+
+    A Portuguese-only legacy source has no dialogue language in common with the
+    master.  It can still be aligned experimentally from preserved music and
+    effects, but must never be described as a common-original comparison.
+    """
+
+    return "common-original" if shared_originals else "cross-language-events"
+
+
+def _same_episode_slot(left: MediaAsset, right: MediaAsset) -> bool:
+    """Whether explicitly supplied files identify the same numbered episode.
+
+    Portuguese legacy releases commonly use a translated series title, so an
+    explicit ``--dual``/``--normal`` pair cannot require the normalized title
+    text to be identical.  Season/episode identity remains mandatory.
+    """
+
+    if left.identity is None or right.identity is None:
+        return False
+    return (
+        left.identity.kind == "episode"
+        and right.identity.kind == "episode"
+        and left.identity.season == right.identity.season
+        and left.identity.episodes == right.identity.episodes
+    )
+
+
 def score_pair(
     normal: MediaAsset,
     dual: MediaAsset,
     *,
     kind: str | None = None,
+    allow_translated_episode_title: bool = False,
 ) -> tuple[float, tuple[str, ...], list[str]]:
     if normal.identity is None or dual.identity is None:
         raise PairingError("Assets must have parsed identities before scoring")
-    if normal.identity.key != dual.identity.key:
+    translated_episode_title = (
+        normal.identity.key != dual.identity.key
+        and allow_translated_episode_title
+        and _same_episode_slot(normal, dual)
+    )
+    if normal.identity.key != dual.identity.key and not translated_episode_title:
         return 0.0, (), ["content identity differs"]
+    kind = kind or source_kind(dual)
     shared = _shared_originals(normal, dual)
-    if not shared:
-        return 0.0, (), ["no tagged non-Portuguese original language is shared"]
+    if kind == "tvrip" and not shared:
+        return 0.0, (), [
+            "Portuguese-only TVRip requires a shared original reference for segment validation"
+        ]
     duration_delta = abs(normal.duration - dual.duration)
     duration_ratio = duration_delta / max(normal.duration, dual.duration, 1.0)
-    kind = kind or source_kind(dual)
     maximum_duration_ratio = 0.50 if kind == "tvrip" else 0.20
     if duration_ratio > maximum_duration_ratio:
         return 0.0, shared, [f"duration differs by {duration_ratio:.1%}"]
     score = 1.0 - min(duration_ratio, maximum_duration_ratio) * (
         0.9 if kind == "tvrip" else 2.5
     )
-    reasons = [f"shared original language: {', '.join(shared)}"]
+    reasons = (
+        [f"shared original language: {', '.join(shared)}"]
+        if shared
+        else [
+            (
+                "no shared original language; using experimental cross-language "
+                "sound-event anchors"
+            )
+        ]
+    )
+    if translated_episode_title:
+        reasons.insert(
+            0,
+            "explicit episode pair uses different series titles; matched by season/episode number",
+        )
     if kind == "tvrip":
         reasons.append("TVRip/broadcast source marker; segmented analysis required")
     if "dual" in dual.path.stem.casefold():
@@ -214,6 +286,7 @@ def collect_pair_candidates(
                         shared_original_languages=shared,
                         reasons=reasons,
                         source_kind=kind,  # type: ignore[arg-type]
+                        alignment_mode=_alignment_mode(shared),  # type: ignore[arg-type]
                     )
                 )
         candidates.sort(
@@ -252,17 +325,29 @@ def require_explicit_pair(normal: MediaAsset, dual: MediaAsset) -> PairCandidate
         raise PairingError(
             "Explicit --normal must lack Portuguese program audio and --dual must contain it"
         )
-    if normal.identity.key != dual.identity.key:
+    if normal.identity.key != dual.identity.key and not _same_episode_slot(normal, dual):
         raise PairingError(
             f"Explicit inputs have different identities: {normal.identity.key} != {dual.identity.key}"
         )
     kind = source_kind(dual)
-    score, shared, reasons = score_pair(normal, dual, kind=kind)
+    score, shared, reasons = score_pair(
+        normal,
+        dual,
+        kind=kind,
+        allow_translated_episode_title=True,
+    )
     if score <= 0:
-        raise PairingError(
-            "Explicit inputs do not share a tagged non-Portuguese original audio language"
-        )
-    return PairCandidate(normal, dual, normal.identity, score, shared, reasons, kind)  # type: ignore[arg-type]
+        raise PairingError("Explicit inputs did not pass identity/source matching")
+    return PairCandidate(  # type: ignore[arg-type]
+        normal,
+        dual,
+        normal.identity,
+        score,
+        shared,
+        reasons,
+        kind,
+        _alignment_mode(shared),
+    )
 
 
 def require_explicit_tvrip_pair(master: MediaAsset, tvrip: MediaAsset) -> PairCandidate:

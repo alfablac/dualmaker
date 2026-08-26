@@ -52,4 +52,4 @@ __all__ = [
     "validate_configuration",
 ]
 
-__version__ = "0.5.43"
+__version__ = "0.6.0"

@@ -9,12 +9,52 @@ from pathlib import Path
 from dualmaker.matching import find_pair_candidates
 from dualmaker.metadata import MediaInspector, _duration_seconds, first_packet_pts, last_packet_end
 from dualmaker.naming import parse_identity
+from dualmaker.trim import remux_avi_to_mkv
 
 TOOLS = ("ffmpeg", "ffprobe", "mediainfo", "mkvmerge")
 
 
 @unittest.skipUnless(all(shutil.which(tool) for tool in TOOLS), "media tools are required")
 class MetadataIntegrationTests(unittest.TestCase):
+    def test_legacy_avi_is_inspected_then_losslessly_staged_as_mkv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            avi = root / "Legacy.Show.S01E01.avi"
+            staged = root / "Legacy.Show.S01E01.staged.mkv"
+            subprocess.run(
+                (
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=64x48:rate=25:duration=1",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=1",
+                    "-map",
+                    "0:v",
+                    "-map",
+                    "1:a",
+                    "-c:v",
+                    "mpeg4",
+                    "-c:a",
+                    "mp3",
+                    str(avi),
+                ),
+                check=True,
+            )
+            inspector = MediaInspector()
+            inspected_avi = inspector.inspect(avi)
+            self.assertEqual(inspected_avi.audio_tracks[0].type_index, 0)
+            self.assertEqual(inspected_avi.audio_tracks[0].effective_language, "und")
+
+            remux_avi_to_mkv(avi, staged)
+            inspected_mkv = inspector.inspect(staged)
+            self.assertEqual(inspected_mkv.audio_tracks[0].type_index, 0)
+            self.assertAlmostEqual(inspected_mkv.duration, inspected_avi.duration, delta=0.1)
     def test_matroska_clock_duration_is_parsed(self) -> None:
         self.assertAlmostEqual(_duration_seconds("00:23:08.921000000") or 0, 1388.921)
 

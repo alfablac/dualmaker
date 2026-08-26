@@ -5,12 +5,13 @@ Documentação completa em português do Brasil: [Como o dualmaker funciona](doc
 `dualmaker` builds a new MKV from two matching releases:
 
 - a **normal** release containing the original-language audio; and
-- a **DUAL** release containing the same original language plus Portuguese dub audio.
+- a **DUAL** release containing Portuguese dub audio, normally with the same original language.
 
 The normal release remains the master for video, chapters, tags, and naming. Audio is selected
 independently by quality: the preferred original may come from either release, while every
 retained source-side dub is synchronized with the master using the bundled `milksync`
-engine. Source files are never changed.
+engine. A legacy Portuguese-only AVI is also accepted: it is remuxed with stream copy to a private
+MKV work file; the source is never changed.
 
 ## Requirements
 
@@ -152,6 +153,10 @@ dualmaker --dual release.DUAL-GROUP.mkv --normal release-GROUP.mkv
 # Supply an exact destination for an explicit pair
 dualmaker --dual dual.mkv --normal normal.mkv --output final.mkv
 
+# Import a Portuguese-only legacy AVI. Its one untagged program track is inferred as pt-BR.
+dualmaker --dual Mulher.Bionica.S01E01.avi --normal The.Bionic.Woman.S01E01.1080p.BluRay.mkv \
+  --allow-experimental-fps-sync
+
 # Explicitly permit analysis of a likely match with different exact frame rates
 dualmaker --dual dual-25fps.mkv --normal master-24000-1001.mkv \
   --allow-experimental-fps-sync
@@ -184,10 +189,14 @@ the complete `SxxExx` identity. Resolution, provider, codec, HDR/Dolby Vision, a
 `DUAL`, and release-group tokens do not have to match.
 
 Media roles come from actual audio metadata. A DUAL candidate must contain Portuguese program
-audio and a non-Portuguese language also found in the normal release. A `DUAL` filename token only
-increases confidence; it does not override the tracks. Ambiguous unattended matches are skipped
-and written to the report. Use `--interactive`, `--original-language`, `--dual-audio`, or
-`--normal-audio` to resolve legacy reference-track choices.
+audio. When a non-Portuguese language is shared with the normal release, it is the primary acoustic
+reference. A Portuguese-only source instead enters the experimental cross-language sound-event
+path. A one-audio AVI whose language is absent is inferred as the configured dub language (`pt-BR`
+by default); multi-audio AVIs still require an explicit track choice. A `DUAL` filename token only
+increases confidence; it does not override tracks. Ambiguous unattended matches are skipped and
+written to the report. For an explicit episode pair, translated series titles are accepted when
+the season and complete episode number match; this is how `Mulher.Bionica.S01E01.avi` can be paired
+with `The.Bionic.Woman.S01E01…mkv`.
 
 Output audio order is:
 
@@ -250,17 +259,66 @@ tags are retained, and font/other attachments from both files are deduplicated b
 
 With `--trim-recap` (the default), dualmaker searches the opening 120 seconds for black sections,
 safe master-video keyframes, and matching spectral fingerprints from the shared original audio.
-It trims only a unique, validated one-sided opening. Use `--recap-window`, `--no-trim-recap`, or
-`--interactive` to adjust that behavior.
+It trims only a unique, validated one-sided opening. Cross-language event synchronization leaves
+the opening intact because translated dialogue cannot prove a recap boundary. Use `--recap-window`,
+`--no-trim-recap`, or `--interactive` to adjust that behavior.
 
-Milksync then calculates the source-to-master shift map from the two original-language tracks.
-Before applying it, dualmaker also measures the first packet timestamp of both reference tracks;
-this preserves container delays that decoded WAV comparison cannot see. Each imported audio
-track's source packet start is also retained when milksync concatenates its edited segments. The
-same corrected reference map is applied to every imported Portuguese audio track and DUAL-side
-subtitle. `--adjust-delay` adds a manual correction on top of this automatic value. Video is always
-stream-copied from the normal master. Imported audio is stream-copied when its codec and required
-edit boundaries allow it; codec fallback required for inserted silence is reported.
+Milksync then calculates the source-to-master shift map from shared original-language tracks, or
+from mutually strong sound events for a Portuguese-only source.
+The first packet timestamp of both references is recorded for diagnosis, but is not treated as a
+dub delay: codec priming and broken container PTS do not prove an offset from the master video.
+The same acoustic reference map is applied to every imported Portuguese audio track and DUAL-side
+subtitle. `--adjust-delay` is an explicit manual override. Video is always stream-copied from the
+normal master. Imported audio is stream-copied when its codec and required edit boundaries allow
+it; codec fallback required for inserted silence is reported.
+
+### Experimental DUAL-source dub resync
+
+`experimental_dub_resync` is enabled by default. It imports a selected Portuguese dub from the
+DUAL/lower-quality release into the normal/master video. When a common original track exists,
+Milksync maps that reference normally. For a Portuguese-only source, it instead uses short,
+high-energy/onset windows and retains mutually strong music hits, impacts, transitions, gunshots,
+doors, and footsteps as cross-language anchors; translated dialogue is not used as a linguistic
+match. A stationary map becomes a constant offset; changing offsets become separate source-to-master
+correction buckets. Compatible different-FPS pairs additionally require the separate
+`--allow-experimental-fps-sync` workflow.
+
+The JSON report includes `experimental_dub_resync`: selected source and master, every acoustic
+anchor, offset range, correction buckets, mapped coverage, video-confirmation evidence, and a
+confidence score. Cross-language jobs report `alignment_mode: cross-language-events` and use the
+short event windows immediately. The default `experimental_dub_resync_min_confidence: 0.80` marks
+a sparse map for review; it does not fabricate dialogue-based anchors.
+
+For a different-FPS Portuguese-only source, dualmaker also measures the raw program clock from
+those event anchors before rendering. It accepts four well-spaced event slopes (instead of the
+denser common-language requirement), tolerates mix variance, and permits a bounded default 10%
+speed range; PAL 25 fps → 23.976 fps is a 4.27% correction. The rendered event map gets one more
+bounded correction pass when it still shows linear drift. An out-of-sync opening with good later
+sections can instead indicate an alternate intro/recap: cross-language mode leaves that opening
+untrimmed because dialogue cannot prove its exact cut boundary.
+Disable the feature with `--no-experimental-dub-resync` (or set
+`experimental_dub_resync: false`), or adjust the threshold with
+`--experimental-dub-resync-min-confidence`.
+
+### Milksync resource limits
+
+Milksync runs numerical CQT/DTW analysis, and its native dependencies may otherwise create a
+thread pool for every CPU core. Dualmaker now caps those pools to two threads, uses one concurrent
+chroma extractor, and slices DTW at 25,000,000 cells by default. This avoids large virtual-memory
+maps and hundreds of idle threads in season batches. Lower limits trade throughput for predictable
+resource use:
+
+```console
+dualmaker /media/releases \
+  --milksync-max-threads 1 \
+  --milksync-chroma-workers 1 \
+  --milksync-max-cost-matrix-cells 8000000
+```
+
+The equivalent `features` configuration keys are `milksync_max_threads`,
+`milksync_chroma_workers`, and `milksync_max_cost_matrix_cells`. Their environment equivalents
+are `DUALMAKER_MILKSYNC_MAX_THREADS`, `DUALMAKER_MILKSYNC_CHROMA_WORKERS`, and
+`DUALMAKER_MILKSYNC_MAX_COST_MATRIX_CELLS`.
 
 By default, dualmaker also compares low-resolution video fingerprints at several points across
 both releases. This reconciles the audio-derived shift with the actual master-video timeline. If
@@ -348,8 +406,9 @@ confidence, anchors, codec warnings, synchronization coverage, and post-map erro
 `compatible_fps_pairs`, `fps_min_match_confidence`, `fps_validation_positions`,
 `fps_search_radius_seconds`, `fps_speed_ratio_tolerance`, `fps_content_speed_factors`,
 `fps_audio_duration_ratio_tolerance`, `fps_spectral_*`, and the `fps_anchor_*` controls under
-`features`; see the generated configuration comments for defaults. This remains experimental and
-may safely reject complex combinations.
+`features`; see the generated configuration comments for defaults. This remains experimental: when
+post-map evidence is inconclusive, dualmaker records the exact samples and error in the JSON report,
+emits a warning, and produces the best available output for manual review.
 
 Matroska container duration is not trusted when a subtitle packet outlasts the feature. Dualmaker
 prefers the primary video and selected audio stream durations (including Matroska `DURATION`

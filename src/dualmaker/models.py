@@ -21,6 +21,8 @@ from .defaults import (
     DEFAULT_DUB_GAP_TRACK_TITLE,
     DEFAULT_DUB_LANGUAGE,
     DEFAULT_END_TOLERANCE_MS,
+    DEFAULT_EXPERIMENTAL_DUB_RESYNC,
+    DEFAULT_EXPERIMENTAL_DUB_RESYNC_MIN_CONFIDENCE,
     DEFAULT_FPS_ADAPTIVE_ANCHORS,
     DEFAULT_FPS_ANCHOR_CANDIDATE_COUNT,
     DEFAULT_FPS_ANCHOR_GLOBAL_COVERAGE,
@@ -49,6 +51,9 @@ from .defaults import (
     DEFAULT_FPS_SPEED_RATIO_TOLERANCE,
     DEFAULT_FPS_VALIDATION_POSITIONS,
     DEFAULT_IGNORED_DIR_NAMES,
+    DEFAULT_MILKSYNC_CHROMA_WORKERS,
+    DEFAULT_MILKSYNC_MAX_COST_MATRIX_CELLS,
+    DEFAULT_MILKSYNC_MAX_THREADS,
     DEFAULT_MIN_MKVMERGE_VERSION,
     DEFAULT_OUTPUT_DIR_NAME,
     DEFAULT_OUTPUT_FORMAT,
@@ -101,6 +106,7 @@ ColorMode = Literal["auto", "always", "never"]
 SubtitlePolicy = Literal["prefer-master", "exact-union"]
 AudioSource = Literal["master", "dual"]
 SourceKind = Literal["dual", "tvrip"]
+AlignmentMode = Literal["common-original", "cross-language-events"]
 TVRipFallback = Literal["ask", "original", "alternate-dub", "silence", "omit"]
 DubGapFallback = Literal["original", "silence", "off"]
 
@@ -339,6 +345,7 @@ class PairCandidate:
     shared_original_languages: tuple[str, ...]
     reasons: list[str] = field(default_factory=list)
     source_kind: SourceKind = "dual"
+    alignment_mode: AlignmentMode = "common-original"
 
 
 @dataclass(slots=True)
@@ -372,6 +379,13 @@ class DualMakerConfig:
     end_tolerance_ms: int = DEFAULT_END_TOLERANCE_MS
     reconcile_av: bool = DEFAULT_RECONCILE_AV
     av_tolerance_ms: int = DEFAULT_AV_TOLERANCE_MS
+    experimental_dub_resync: bool = DEFAULT_EXPERIMENTAL_DUB_RESYNC
+    experimental_dub_resync_min_confidence: float = (
+        DEFAULT_EXPERIMENTAL_DUB_RESYNC_MIN_CONFIDENCE
+    )
+    milksync_max_threads: int = DEFAULT_MILKSYNC_MAX_THREADS
+    milksync_chroma_workers: int = DEFAULT_MILKSYNC_CHROMA_WORKERS
+    milksync_max_cost_matrix_cells: int = DEFAULT_MILKSYNC_MAX_COST_MATRIX_CELLS
     allow_experimental_fps_sync: bool = DEFAULT_ALLOW_EXPERIMENTAL_FPS_SYNC
     compatible_fps_pairs: tuple[str, ...] = DEFAULT_COMPATIBLE_FPS_PAIRS
     fps_max_drift_seconds: float = DEFAULT_FPS_MAX_DRIFT_SECONDS
@@ -496,6 +510,7 @@ class JobPlan:
     output_original: AudioTrackSelection | None = None
     fps: FPSDecision = field(default_factory=FPSDecision)
     source_kind: SourceKind = "dual"
+    alignment_mode: AlignmentMode = "common-original"
 
     @property
     def resolved_dubs(self) -> list[AudioTrackSelection]:

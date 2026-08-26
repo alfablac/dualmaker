@@ -220,6 +220,63 @@ def _select_originals(
     return normal_reference, dual_reference, output_original
 
 
+def _select_cross_language_references(
+    candidate: PairCandidate,
+    config: DualMakerConfig,
+    dubs: list[AudioTrackSelection],
+) -> tuple[Track, Track, AudioTrackSelection]:
+    """Select a master original and a Portuguese event-anchor reference.
+
+    The source-side Portuguese track is used solely to build the acoustic map;
+    it is not relabelled as an original-language output track.  Milksync's
+    short event windows then favor shared music, impacts, doors, and footsteps
+    over translated dialogue.
+    """
+
+    requested = base_language(config.original_language) if config.original_language else None
+    explicit_normal = _by_ids(candidate.normal, config.normal_audio_ids, kind="audio")
+    if len(explicit_normal) > 1:
+        raise PairingError("Only one --normal-audio track may define the master reference")
+    if config.original_track_selector:
+        source, selected = _selected_track(candidate, config.original_track_selector)
+        if source != "master" or is_portuguese(selected.effective_language):
+            raise PairingError(
+                "Cross-language event synchronization requires a non-Portuguese "
+                "master --original-track"
+            )
+        normal_options = [selected]
+    elif explicit_normal:
+        normal_options = explicit_normal
+    else:
+        normal_options = [
+            track
+            for track in candidate.normal.audio_tracks
+            if not is_portuguese(track.effective_language) and not track.commentary
+            and (requested is None or base_language(track.effective_language) == requested)
+        ]
+    if not normal_options:
+        raise PairingError(
+            "No non-Portuguese master audio is available for cross-language event synchronization"
+        )
+    languages = {base_language(track.effective_language) for track in normal_options}
+    if requested and requested not in languages:
+        raise PairingError(
+            f"Requested original language {config.original_language!r} is not available "
+            "on the master"
+        )
+    if len(languages) > 1 and not (explicit_normal or config.original_track_selector):
+        raise AmbiguousPairError(
+            "More than one master original language is available; pass --original-language "
+            "or --original-track master:ID"
+        )
+    ranked = [
+        _score_track("master", track, candidate.normal, config, role="original")
+        for track in normal_options
+    ]
+    output_original = _choose_best("original", ranked, config)
+    return output_original.track, dubs[0].track, output_original
+
+
 def _select_dubs(candidate: PairCandidate, config: DualMakerConfig) -> list[AudioTrackSelection]:
     requested_language = base_language(config.dub_language)
     explicit: list[tuple[AudioSource, Track]] = []
@@ -287,7 +344,7 @@ def create_job_plan(
     *,
     sidecar_subtitles: list[SidecarSubtitle] | None = None,
 ) -> JobPlan:
-    if candidate.source_kind == "tvrip":
+    if candidate.source_kind == "tvrip" and candidate.alignment_mode == "common-original":
         if config.tvrip_require_interactive_approval and not config.interactive:
             raise ExperimentalTVRipRequiredError(
                 "TVRip policy requires interactive segment approval; rerun with --interactive"
@@ -297,8 +354,19 @@ def create_job_plan(
                 "An editorially different TVRip candidate requires segmented validation; "
                 "pass --allow-tvrip-segment-sync or use --interactive"
             )
-    normal_original, dual_original, output_original = _select_originals(candidate, config)
     dubs = _select_dubs(candidate, config)
+    if candidate.alignment_mode == "cross-language-events":
+        normal_original, dual_original, output_original = _select_cross_language_references(
+            candidate, config, dubs
+        )
+    else:
+        normal_original, dual_original, output_original = _select_originals(candidate, config)
+    if not config.experimental_dub_resync and any(item.source == "dual" for item in dubs):
+        raise PairingError(
+            "Importing a dubbed track from the DUAL source onto the master video is "
+            "disabled; enable experimental_dub_resync or pass "
+            "--experimental-dub-resync"
+        )
     fps = evaluate_fps_pair(candidate.normal, candidate.dual, config)
     if fps.required:
         if not fps.compatible:
@@ -339,5 +407,13 @@ def create_job_plan(
         dub_selections=dubs,
         output_original=output_original,
         fps=fps,
-        source_kind=candidate.source_kind,
+        # TVRip's segment validator compares a common original track.  A
+        # Portuguese-only source instead uses the separate event-anchor path,
+        # so it cannot safely enter that dialogue-dependent validator.
+        source_kind=(
+            candidate.source_kind
+            if candidate.alignment_mode == "common-original"
+            else "dual"
+        ),
+        alignment_mode=candidate.alignment_mode,
     )

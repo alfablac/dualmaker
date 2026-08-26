@@ -90,8 +90,10 @@ class MediaInspector:
         media_path = Path(path).expanduser().resolve()
         if not media_path.is_file():
             raise MetadataError(f"Media file does not exist: {media_path}")
+        if media_path.suffix.lower() == ".avi":
+            return self._inspect_avi(media_path)
         if media_path.suffix.lower() != ".mkv":
-            raise MetadataError(f"Only MKV input is supported: {media_path}")
+            raise MetadataError(f"Only MKV or AVI input is supported: {media_path}")
 
         mediainfo = self.runner.json(("mediainfo", "--Output=JSON", media_path))
         mkvmerge = self.runner.json(("mkvmerge", "-J", media_path))
@@ -213,6 +215,105 @@ class MediaInspector:
             chapters=list(ffprobe.get("chapters") or []),
             mediainfo=mediainfo,
             mkvmerge=mkvmerge,
+            ffprobe=ffprobe,
+            frame_rate=_frame_rate(ffprobe),
+        )
+
+    def _inspect_avi(self, media_path: Path) -> MediaAsset:
+        """Inspect a legacy AVI by stream order before staging it as Matroska.
+
+        AVI has no Matroska track IDs, language flags, attachments, or chapter
+        model.  FFprobe stream indexes are stable enough for planning; the
+        source is losslessly remuxed to a private MKV before Milksync or the
+        final mux uses it.
+        """
+
+        mediainfo = self.runner.json(("mediainfo", "--Output=JSON", media_path))
+        ffprobe = self.runner.json(
+            (
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_format",
+                "-show_streams",
+                "-show_chapters",
+                "-of",
+                "json",
+                media_path,
+            )
+        )
+        mi_by_kind = _mediainfo_tracks(mediainfo)
+        indexes: dict[str, int] = {}
+        tracks: list[Track] = []
+        for raw_track in ffprobe.get("streams", []):
+            kind = _kind(str(raw_track.get("codec_type", "unknown")))
+            type_index = indexes.get(kind, 0)
+            indexes[kind] = type_index + 1
+            mi_kind = "text" if kind == "subtitles" else kind
+            mi_track_list = mi_by_kind.get(mi_kind, [])
+            mi_track = mi_track_list[type_index] if type_index < len(mi_track_list) else {}
+            tags = dict(raw_track.get("tags") or {})
+            disposition = dict(raw_track.get("disposition") or {})
+            language = normalize_language(tags.get("language") or mi_track.get("Language"))
+            title = str(tags.get("title") or mi_track.get("Title") or "")
+            tracks.append(
+                Track(
+                    id=int(raw_track.get("index", len(tracks))),
+                    kind=kind,  # type: ignore[arg-type]
+                    type_index=type_index,
+                    codec=str(
+                        mi_track.get("Format_Commercial_IfAny")
+                        or mi_track.get("Format_Profile")
+                        or raw_track.get("codec_long_name")
+                        or raw_track.get("codec_name")
+                        or mi_track.get("Format")
+                        or ""
+                    ),
+                    codec_id=str(
+                        raw_track.get("codec_tag_string") or raw_track.get("codec_name") or ""
+                    ),
+                    language=language,
+                    language_ietf=language,
+                    title=title,
+                    default=bool(disposition.get("default", False)),
+                    forced=bool(disposition.get("forced", False)),
+                    hearing_impaired=bool(disposition.get("hearing_impaired", False)),
+                    commentary=bool(disposition.get("comment", False))
+                    or bool(COMMENTARY_RE.search(title)),
+                    channels=_number(raw_track.get("channels") or mi_track.get("Channels"), int),
+                    bitrate=_number(raw_track.get("bit_rate") or mi_track.get("BitRate"), int),
+                    sample_rate=_number(
+                        raw_track.get("sample_rate") or mi_track.get("SamplingRate"), int
+                    ),
+                    duration=_duration_seconds(
+                        raw_track.get("duration")
+                        or tags.get("DURATION")
+                        or mi_track.get("Duration")
+                    ),
+                    properties={"ffprobe_index": raw_track.get("index")},
+                )
+            )
+
+        primary_video = next(
+            (
+                track.duration
+                for track in tracks
+                if track.kind == "video" and track.duration is not None and track.duration > 0
+            ),
+            None,
+        )
+        duration = primary_video or _duration_seconds(ffprobe.get("format", {}).get("duration"))
+        if duration is None:
+            general = mi_by_kind.get("general", [{}])[0]
+            duration = _duration_seconds(general.get("Duration"))
+        if duration is None or duration <= 0:
+            raise MetadataError(f"Could not determine a positive duration for {media_path}")
+        return MediaAsset(
+            path=media_path,
+            duration=float(duration),
+            tracks=tracks,
+            chapters=list(ffprobe.get("chapters") or []),
+            mediainfo=mediainfo,
             ffprobe=ffprobe,
             frame_rate=_frame_rate(ffprobe),
         )

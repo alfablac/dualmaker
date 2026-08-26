@@ -25,6 +25,7 @@ import pymediainfo
 import pysubs2
 from annoy import AnnoyIndex
 from numpy.lib.stride_tricks import sliding_window_view
+from scipy.signal import find_peaks
 from scipy.spatial.distance import cdist, cosine
 from skimage.metrics import structural_similarity
 from tqdm import tqdm
@@ -41,6 +42,23 @@ HOP_LENGTH = None
 
 SAMPLES_PATH = Path(__file__).parents[1] / 'samples'
 LOSSLESS_CODECS = ('flac', 'alac', 'truehd', 'thd')
+
+# Cross-language alignment needs evidence that survives a changed dialogue
+# recording and a different mix.  Continuous music can have high RMS for
+# minutes at a time, so it is specifically *not* an event by itself.  These
+# values favour isolated spectral changes such as impacts, doors, gunshots and
+# hard footstep/transitions, while still admitting a strong musical hit.
+# The threshold applies *after* peak isolation and mutual matching.  It can
+# therefore be comparatively lax for a low-bitrate dub without admitting a
+# continuous music bed, which has zero event strength between its transients.
+EVENT_MIN_STRENGTH = 0.20
+EVENT_PEAK_SEPARATION_SECONDS = 0.30
+EVENT_OFFSET_QUANTUM_SECONDS = 0.25
+EVENT_LOCAL_SUPPORT_SECONDS = 18.0
+EVENT_MIN_LOCAL_SUPPORT = 3
+EVENT_MIN_LOCAL_SUPPORT_FRACTION = 0.60
+EVENT_MIN_SEGMENT_SECONDS = 18.0
+EVENT_CHROMA_CACHE_VERSION = "event-v2"
 
 
 class Video:
@@ -391,14 +409,115 @@ def estimate_audio_shift_points_from_subtitles(
     return audio_shift_points, sync_buckets, delete_buckets
 
 
+def _quantize_event_offset(offset: float) -> float:
+    """Group event offsets more coarsely than one CQT hop.
+
+    A CQT hop is about 46 ms at the normal 22.05 kHz/1024 configuration.  A
+    dubbed mix can move a transient by one or two hops without changing which
+    event it is.  Treating those tiny differences as a new timeline edit made
+    the old event path manufacture hundreds of short buckets.
+    """
+
+    return round(offset / EVENT_OFFSET_QUANTUM_SECONDS) * EVENT_OFFSET_QUANTUM_SECONDS
+
+
+def _stable_event_shift_points(
+    correspondences: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, float]]:
+    """Keep only locally corroborated cross-language transient matches.
+
+    ``correspondences`` contains ``(target, source, offset, strength)`` from
+    the CQT DTW path.  DTW supplies a monotonic candidate pairing, but it is
+    deliberately permissive around music and speech.  A useful dubbed-audio
+    anchor must therefore be supported by several *separate* sharp peaks in a
+    short neighbourhood.  This rejects an isolated recurring musical phrase
+    that happens to look similar in both releases.
+    """
+
+    if len(correspondences) < EVENT_MIN_LOCAL_SUPPORT:
+        return []
+
+    candidates = sorted(correspondences, key=lambda item: (item[0], item[1]))
+    supported: list[tuple[float, float, float]] = []
+    for target, source, _offset, _strength in candidates:
+        local = [
+            item
+            for item in candidates
+            if abs(item[0] - target) <= EVENT_LOCAL_SUPPORT_SECONDS
+            and abs(item[1] - source) <= EVENT_LOCAL_SUPPORT_SECONDS
+        ]
+        bins = Counter(_quantize_event_offset(item[2]) for item in local)
+        if not bins:
+            continue
+        offset_bin, support = bins.most_common(1)[0]
+        if (
+            support < EVENT_MIN_LOCAL_SUPPORT
+            or support / len(local) < EVENT_MIN_LOCAL_SUPPORT_FRACTION
+            or _quantize_event_offset(_offset) != offset_bin
+        ):
+            continue
+        agreeing_offsets = [item[2] for item in local if _quantize_event_offset(item[2]) == offset_bin]
+        supported.append((target, source, float(np.median(agreeing_offsets))))
+
+    if not supported:
+        return []
+
+    # One stable offset is enough for a continuous region.  Retain a new
+    # point only when the offset is persistently different; otherwise the
+    # source bucket would flicker at every high-energy frame.  A short-lived
+    # excursion is normally a repeated cue or a bad DTW turn, not an edit.
+    runs: list[list[tuple[float, float, float]]] = []
+    for point in supported:
+        if not runs:
+            runs.append([point])
+            continue
+        previous = runs[-1]
+        previous_offset = float(np.median([item[2] for item in previous]))
+        if abs(point[2] - previous_offset) <= EVENT_OFFSET_QUANTUM_SECONDS:
+            previous.append(point)
+        else:
+            runs.append([point])
+
+    stable_runs: list[list[tuple[float, float, float]]] = []
+    for index, run in enumerate(runs):
+        span = run[-1][0] - run[0][0]
+        is_edge = index in (0, len(runs) - 1)
+        # Keep edge runs: they establish the initial/final timeline.  Interior
+        # changes must last long enough to be an editorial segment rather than
+        # a one-off false music match.
+        if is_edge or span >= EVENT_MIN_SEGMENT_SECONDS:
+            stable_runs.append(run)
+        else:
+            logger.info(
+                "Discarding %.3fs cross-language event excursion at %.3fs; "
+                "it lacks persistent transient support",
+                span,
+                run[0][0],
+            )
+
+    shift_points: list[tuple[float, float, float]] = []
+    for run in stable_runs:
+        # The most distinctive mutually matched peak is a better representative
+        # than the first one in a run.  Offset is the robust local median.
+        target, source, _offset = run[len(run) // 2]
+        offset = float(np.median([item[2] for item in run]))
+        if shift_points and abs(offset - shift_points[-1][2]) <= EVENT_OFFSET_QUANTUM_SECONDS:
+            continue
+        shift_points.append((target, source, offset))
+    return shift_points
+
+
 def estimate_audio_shift_points(
     x_1_chroma,
     x_2_chroma,
     fs,
-    max_cost_matrix_size=100_000_000,
+    max_cost_matrix_size=25_000_000,
     only_delta=False,
     adjust_delay=None,
     sliding_window_size=300,
+    event_anchors=False,
+    source_event_strength=None,
+    target_event_strength=None,
 ):
     expected_matrix_size = len(x_1_chroma) * len(x_2_chroma)
 
@@ -456,7 +575,15 @@ def estimate_audio_shift_points(
         t2_already_seen = set()
 
         for t1, t2 in wp_s:
-            should_skip = t1 in t1_already_seen or t2 in t2_already_seen
+            # Normal synchronization wants one DTW coordinate per timeline
+            # frame.  Event mode is different: a horizontal/vertical DTW step
+            # can first touch a non-peak frame and then the actual transient
+            # at the same target/source timestamp.  Keep that path detail
+            # until the later peak-level deduplication, otherwise valid
+            # low-bitrate dub impacts disappear before they can vote.
+            should_skip = (
+                not event_anchors and (t1 in t1_already_seen or t2 in t2_already_seen)
+            )
             t1_already_seen.add(t1)
             t2_already_seen.add(t2)
             if should_skip:
@@ -485,15 +612,73 @@ def estimate_audio_shift_points(
             all_timestamps = timestamps
             all_diffs = diffs
 
-    if only_delta:
+    if event_anchors and source_event_strength is not None and target_event_strength is not None:
+        event_correspondences = []
+        seen_target_peaks = set()
+        seen_source_peaks = set()
+        for diff, (target_time, source_time) in zip(all_diffs, all_timestamps):
+            target_index = min(
+                max(round(target_time * fs / HOP_LENGTH), 0), len(target_event_strength) - 1
+            )
+            source_index = min(
+                max(round(source_time * fs / HOP_LENGTH), 0), len(source_event_strength) - 1
+            )
+            strength = min(target_event_strength[target_index], source_event_strength[source_index])
+            # Event arrays contain only isolated spectral-transient peaks.
+            # Deduplicating peak indices prevents the DTW path from giving a
+            # single gunshot dozens of votes just because it lingers over a few
+            # adjacent CQT frames.
+            if (
+                strength >= EVENT_MIN_STRENGTH
+                and target_index not in seen_target_peaks
+                and source_index not in seen_source_peaks
+            ):
+                event_correspondences.append((target_time, source_time, diff, float(strength)))
+                seen_target_peaks.add(target_index)
+                seen_source_peaks.add(source_index)
+
+        event_points = _stable_event_shift_points(event_correspondences)
+        if event_points:
+            logger.info(
+                "Using %d corroborated spectral-transient anchor(s) for cross-language alignment",
+                len(event_points),
+            )
+            # The CQT breakpoint scan below is designed for common-language
+            # audio.  On dubbing it can walk from a valid impact into a similar
+            # sustained music bed and undo the transient evidence we just
+            # selected.  Return the event representatives unchanged.
+            first_target, first_source, first_offset = event_points[0]
+            # The first corroborated impact can occur well into an otherwise
+            # continuous opening.  Its stable offset is the best evidence for
+            # the preceding material too; otherwise the audio renderer starts
+            # at that late event and leaves the entire opening unmapped.
+            shift = min(first_target, first_source)
+            event_points[0] = (
+                first_target - shift,
+                first_source - shift,
+                first_offset,
+            )
+            return event_points
+        logger.warning(
+            "No locally corroborated cross-language transient anchors were found; "
+            "refusing to use the full music/speech DTW path as a fallback"
+        )
+        return []
+
+    if event_anchors:
+        min_abs_diff = 0.035
+    elif only_delta:
         min_abs_diff = 0.03
     else:
         min_abs_diff = 0.06
     # sliding_window_size = 300 TODO: make it change near the end to detect changes while keeping it higher before.
     shift_points = []
     last_most_common = None
+    if not all_diffs:
+        return []
+    effective_window_size = min(sliding_window_size, len(all_diffs))
     for i, v in enumerate(
-        sliding_window_view(all_diffs, window_shape=sliding_window_size)
+        sliding_window_view(all_diffs, window_shape=effective_window_size)
     ):
         most_common, most_common_count = Counter(v).most_common(1)[0]
         if (
@@ -686,9 +871,57 @@ def generate_chroma_cqt(
     chroma = librosa.feature.chroma_cqt(
         y=y, sr=fs, hop_length=HOP_LENGTH, n_chroma=n_chroma
     ).T
-    target_file.write_bytes(pickle.dumps((chroma, fs)))
+    # Cross-language synchronization cannot use spoken words as evidence.
+    # RMS alone is actively harmful here: a music bed remains loud for a long
+    # time and therefore makes almost every frame look like a possible anchor.
+    # Instead retain only locally prominent spectral onsets, weighted by their
+    # instantaneous energy.  This is intentionally an *impact detector*, not
+    # a generic loudness detector.
+    rms = librosa.feature.rms(y=y, hop_length=HOP_LENGTH)[0]
+    onset = librosa.onset.onset_strength(y=y, sr=fs, hop_length=HOP_LENGTH)
+
+    def normalize_event(values, *, percentiles):
+        floor, ceiling = np.percentile(values, percentiles)
+        return np.clip((values - floor) / max(ceiling - floor, 1e-9), 0.0, 1.0)
+
+    energy = normalize_event(rms, percentiles=(35, 95))
+    # A local average establishes the current music/room-noise bed.  Only the
+    # rise above that bed can vote as a cross-language event.
+    onset_window = min(max(round(fs / HOP_LENGTH), 3), len(onset))
+    onset_baseline = (
+        np.convolve(
+            onset,
+            np.full(onset_window, 1.0 / onset_window),
+            mode="same",
+        )
+        if onset_window
+        else np.zeros_like(onset)
+    )
+    onset_contrast = np.maximum(onset - onset_baseline, 0.0)
+    transient = normalize_event(onset_contrast, percentiles=(60, 99))
+    event_strength = transient * (0.30 + 0.70 * energy)
+
+    # Preserve a single representative for each transient.  This both rejects
+    # sustained music and prevents one sharp sound from being counted as many
+    # independent confirmations along the DTW path.
+    peak_distance = max(round(EVENT_PEAK_SEPARATION_SECONDS * fs / HOP_LENGTH), 1)
+    peak_indexes, _ = find_peaks(
+        event_strength,
+        height=0.05,
+        prominence=0.08,
+        distance=peak_distance,
+    )
+    isolated_events = np.zeros_like(event_strength)
+    isolated_events[peak_indexes] = event_strength[peak_indexes]
+    event_strength = isolated_events
+    if len(event_strength) < len(chroma):
+        event_strength = np.pad(event_strength, (0, len(chroma) - len(event_strength)))
+    else:
+        event_strength = event_strength[: len(chroma)]
+    event_strength = event_strength.astype(np.float32, copy=False)
+    target_file.write_bytes(pickle.dumps((chroma, fs, event_strength)))
     target_wav_file.unlink()
-    return chroma, fs
+    return chroma, fs, event_strength
 
 
 def find_and_align_chapter(x_1_chroma, x_2_chroma, fs, min_match_value=60):
@@ -1573,6 +1806,32 @@ def _tqdm_output(process):
     "--adjust-delay", type=float, help="Maually adjust delay."
 )  # TODO: define audio track to do it to
 @click.option(
+    "--acoustic-anchor-window-size",
+    type=click.IntRange(min=32),
+    default=300,
+    show_default=True,
+    help="Chroma frames per acoustic alignment window; smaller values admit shorter sound-event anchors.",
+)
+@click.option(
+    "--event-anchors",
+    is_flag=True,
+    help="Build cross-language anchors from mutually strong audio onsets and high-energy effects.",
+)
+@click.option(
+    "--max-cost-matrix-size",
+    type=click.IntRange(min=1_000_000),
+    default=25_000_000,
+    show_default=True,
+    help="Maximum dense DTW cost-matrix cells per slice; larger values use more memory.",
+)
+@click.option(
+    "--chroma-workers",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="Concurrent audio-chroma extraction workers.",
+)
+@click.option(
     "--sync-non-dialogue-to-video",
     type=INTEGER_RANGE,
     help="Sync non-dialogue using frames instead of audio, good for e.g. remastered where they audio might be re-aligned",
@@ -1687,6 +1946,10 @@ def main(
     audio_tracks,
     adjust_shift_point,
     adjust_delay,
+    acoustic_anchor_window_size,
+    event_anchors,
+    max_cost_matrix_size,
+    chroma_workers,
     sync_non_dialogue_to_video,
     chapter_source,
     chapter_beginning,
@@ -1802,6 +2065,16 @@ def main(
 
     chromas = {}
 
+    def load_chroma_cache(path):
+        cached = pickle.loads(path.read_bytes())
+        if len(cached) == 3:
+            return cached
+        # Caches from releases before event anchors remain usable for normal
+        # same-language synchronization. Event mode will identify the missing
+        # measurements and fall back rather than inventing confidence.
+        chroma, sample_rate = cached
+        return chroma, sample_rate, np.zeros(len(chroma), dtype=np.float32)
+
     framerate_aligns = {}
     if align_framerate:
         target_framerate = output_video_file.video_info["fps"]
@@ -1816,7 +2089,7 @@ def main(
                     else (video_framerate, target_framerate)
                 )
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=chroma_workers) as executor:
         jobqueue = {}
         for i, (f, audio_track_id) in enumerate(zip(files, sync_audio_track_mapping)):
             framerate_align = framerate_aligns.get(i)
@@ -1829,11 +2102,11 @@ def main(
 
             audio_chroma_output_file = temp_folder / (
                 f.stem
-                + f"{framerate_align_filename}{preserve_silence_filename}.{HOP_LENGTH}.{n_chroma}.{audio_track_id}.chroma"
+                + f"{framerate_align_filename}{preserve_silence_filename}.{HOP_LENGTH}.{n_chroma}.{audio_track_id}.{EVENT_CHROMA_CACHE_VERSION}.chroma"
             )
             if audio_chroma_output_file.exists():
                 logger.info(f"Loading chroma from {audio_chroma_output_file}")
-                chromas[f] = pickle.loads(audio_chroma_output_file.read_bytes())
+                chromas[f] = load_chroma_cache(audio_chroma_output_file)
             else:
                 logger.info(f"Extracting chroma from {f.name}")
                 future = executor.submit(
@@ -1850,11 +2123,12 @@ def main(
         for f in chapter_segment_files:
             preserve_silence_filename = preserve_silence and ".ps" or ""
             audio_chroma_output_file = temp_folder / (
-                f.stem + f"{preserve_silence_filename}.{HOP_LENGTH}.{n_chroma}.c.chroma"
+                f.stem
+                + f"{preserve_silence_filename}.{HOP_LENGTH}.{n_chroma}.c.{EVENT_CHROMA_CACHE_VERSION}.chroma"
             )
             if audio_chroma_output_file.exists():
                 logger.info(f"Loading chroma from {audio_chroma_output_file}")
-                chromas[f] = pickle.loads(audio_chroma_output_file.read_bytes())
+                chromas[f] = load_chroma_cache(audio_chroma_output_file)
             else:
                 logger.info(f"Extracting chroma from {f.name}")
                 future = executor.submit(
@@ -1874,14 +2148,14 @@ def main(
         logger.info("Done generating chroma")
         quit(0)
 
-    x_2_chroma, fs = chromas[
+    x_2_chroma, fs, x_2_events = chromas[
         files[output_video_file_index]
     ]  # x_2_chroma is always target video, the one we align everything with
 
     chapter_timestamps = []
     for f, (start_name, end_name) in chapter_segment_files.items():
         logger.info(f"Looking for chapter matching {f}")
-        x_1_chroma, fs = chromas[f]
+        x_1_chroma, fs, _ = chromas[f]
         chapter_specifications = find_and_align_chapter(
             x_1_chroma, x_2_chroma, fs, min_match_value=60 + (n_chroma * 3)
         )
@@ -1941,7 +2215,7 @@ def main(
         if i == output_video_file_index:
             continue
 
-        x_1_chroma, fs = chromas[f]
+        x_1_chroma, fs, x_1_events = chromas[f]
         if sync_using_subtitle_audio:
             for j, (file_index, track_id) in enumerate(output_subtitle_mapping):
                 if file_index != i:
@@ -1973,9 +2247,13 @@ def main(
                 x_1_chroma,
                 x_2_chroma,
                 fs,
+                max_cost_matrix_size=max_cost_matrix_size,
                 only_delta=only_delta,
                 adjust_delay=adjust_delay,
-                sliding_window_size=300,
+                sliding_window_size=acoustic_anchor_window_size,
+                event_anchors=event_anchors,
+                source_event_strength=x_1_events,
+                target_event_strength=x_2_events,
             )
 
             for skip_point in skip_shift_point:
@@ -2012,6 +2290,7 @@ def main(
             "audio_shift_points": audio_shift_points,
             "sync_buckets": sync_buckets,
             "delete_buckets": delete_buckets,
+            "event_anchors": event_anchors,
             "framerate_align": framerate_aligns.get(i),
             "framerate_speed_factor": (
                 framerate_aligns[i][1] / framerate_aligns[i][0]

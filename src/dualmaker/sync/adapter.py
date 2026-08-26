@@ -5,7 +5,7 @@ import logging
 import os
 import statistics
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ..defaults import SIDECAR_LEGACY_TEXT_ENCODINGS, SIDECAR_TEXT_OUTPUT_ENCODING
@@ -16,6 +16,30 @@ from ..runner import ToolRunner
 
 LOGGER = logging.getLogger("dualmaker")
 TEXT_SUBTITLE_CODEC_IDS = {"S_TEXT/UTF8", "S_TEXT/ASS", "S_TEXT/SSA", "S_TEXT/WEBVTT"}
+EVENT_RETRY_ANCHOR_WINDOW = 96
+
+
+def _event_tempo_config(config: DualMakerConfig) -> DualMakerConfig:
+    """Relax only the evidence-count tolerance for cross-language events.
+
+    An original-language map can demand a dense run of dialogue/music matches.
+    Portuguese-vs-original input instead has fewer trustworthy shared effects,
+    so accept four well-spaced event slopes while allowing the larger variance
+    introduced by different mixes.  The speed range remains bounded to a
+    conservative 10%, which covers PAL 25 -> 23.976 conversion (4.27%).
+    """
+
+    return replace(
+        config,
+        fps_spectral_min_pairs=min(config.fps_spectral_min_pairs, 4),
+        fps_spectral_pair_min_seconds=min(config.fps_spectral_pair_min_seconds, 10.0),
+        fps_spectral_pair_max_seconds=max(config.fps_spectral_pair_max_seconds, 300.0),
+        fps_spectral_max_dispersion=max(config.fps_spectral_max_dispersion, 0.040),
+        fps_spectral_slope_cluster_radius=max(config.fps_spectral_slope_cluster_radius, 0.010),
+        fps_spectral_max_speed_adjustment=max(
+            config.fps_spectral_max_speed_adjustment, 0.10
+        ),
+    )
 
 
 def is_text_subtitle(track: Track) -> bool:
@@ -201,7 +225,11 @@ class MilksyncAdapter:
     def __init__(self, runner: ToolRunner | None = None) -> None:
         self.runner = runner or ToolRunner()
 
-    def _prepare_private_environment(self, temp_dir: Path) -> None:
+    def _prepare_private_environment(
+        self,
+        temp_dir: Path,
+        config: DualMakerConfig,
+    ) -> None:
         """Expose configured tools to bundled Milksync inside this private job."""
 
         shim_dir = temp_dir / "tool-shims"
@@ -219,6 +247,20 @@ class MilksyncAdapter:
         if not existing_path.startswith(f"{shim_dir}{os.pathsep}"):
             self.runner.environment["PATH"] = os.pathsep.join((str(shim_dir), existing_path))
         self.runner.environment.setdefault("NUMBA_CACHE_DIR", str(numba_cache_dir))
+        # NumPy/SciPy/Numba can each create one native pool per available core.
+        # Cap every known backend in the private job environment: this avoids
+        # hundreds of mostly idle LWPs and enormous virtual-memory reservations.
+        thread_limit = str(config.milksync_max_threads)
+        for variable in (
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "NUMBA_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+            "BLIS_NUM_THREADS",
+        ):
+            self.runner.environment[variable] = thread_limit
 
     def _refine_experimental_speed(
         self,
@@ -231,6 +273,7 @@ class MilksyncAdapter:
     ) -> None:
         if not plan.fps.required or not config.fps_spectral_tempo_probe:
             return
+        event_mode = plan.alignment_mode == "cross-language-events"
         telecine_tvrip_realtime = bool(
             plan.source_kind == "tvrip"
             and abs(plan.fps.proposed_speed_factor - 1.0) <= 0.000_001
@@ -279,44 +322,73 @@ class MilksyncAdapter:
             "--skip-subtitles",
             "--analyze-only",
         ]
+        if event_mode:
+            command += [
+                "--event-anchors",
+                "--acoustic-anchor-window-size",
+                str(EVENT_RETRY_ANCHOR_WINDOW),
+            ]
         if config.only_delta:
             command.append("--only-delta")
         if config.preserve_silence:
             command.append("--preserve-silence")
-        LOGGER.info("Measuring program speed from common-original acoustic fingerprints")
+        LOGGER.info(
+            "Measuring program speed from %s acoustic fingerprints",
+            "cross-language sound events" if event_mode else "common-original",
+        )
         result = self.runner.run(command, check=False)
         if result.returncode != 0 or not report.is_file():
             detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic output"
-            raise ProcessingError(
-                "Experimental spectral tempo preflight failed: " f"{detail[-4000:]}"
-            )
+            analysis = {
+                "reliable": False,
+                "fallback_accepted": True,
+                "fallback_mode": "render-with-fps-hypothesis",
+                "reason": (
+                    "Experimental spectral tempo preflight did not complete; "
+                    "continuing with the selected FPS hypothesis and validating the "
+                    f"completed synchronization map: {detail[-4000:]}"
+                ),
+                "visual_candidate_before_probe": plan.fps.proposed_speed_factor,
+            }
+            plan.fps.validation["spectral_tempo_probe"] = analysis
+            LOGGER.warning("%s", analysis["reason"])
+            return
         raw_report = json.loads(report.read_text(encoding="utf-8"))
         points = [tuple(point) for point in (raw_report.get("0") or {}).get("audio_shift_points", [])]
-        analysis = estimate_spectral_tempo(points, config)  # type: ignore[arg-type]
+        analysis_config = _event_tempo_config(config) if event_mode else config
+        analysis = estimate_spectral_tempo(points, analysis_config)  # type: ignore[arg-type]
         analysis["visual_candidate_before_probe"] = plan.fps.proposed_speed_factor
+        analysis["alignment_mode"] = plan.alignment_mode
+        if event_mode:
+            analysis["relaxed_event_evidence"] = {
+                "minimum_pairs": analysis_config.fps_spectral_min_pairs,
+                "minimum_pair_seconds": analysis_config.fps_spectral_pair_min_seconds,
+                "maximum_pair_seconds": analysis_config.fps_spectral_pair_max_seconds,
+                "maximum_dispersion": analysis_config.fps_spectral_max_dispersion,
+            }
         plan.fps.validation["spectral_tempo_probe"] = analysis
-        acoustic_tvrip_fallback = bool(
-            plan.fps.validation.get("telecine_acoustic_preflight")
-        )
         if not analysis["reliable"]:
-            if acoustic_tvrip_fallback:
-                analysis["fallback_accepted"] = True
-                analysis["reason"] = (
-                    f"{analysis['reason']}; retained a real-time telecine clock and deferred "
-                    "acceptance to the completed Milksync map plus TVRip segment validation"
-                )
-                return
-            raise ProcessingError(
-                "Experimental spectral tempo analysis was inconclusive: "
-                f"{analysis['reason']}"
+            analysis["fallback_accepted"] = True
+            analysis["fallback_mode"] = "render-with-fps-hypothesis"
+            analysis["reason"] = (
+                f"Experimental spectral tempo analysis was inconclusive: "
+                f"{analysis['reason']}; continuing with the selected FPS hypothesis and "
+                "validating the completed synchronization map"
             )
+            LOGGER.warning("%s", analysis["reason"])
+            return
         measured = float(analysis["speed_factor"])
         plan.fps.proposed_speed_factor = measured
         plan.fps.detected_speed_factor = measured
         plan.fps.apply_speed_correction = abs(measured - 1.0) > 0.000_001
         plan.fps.reason = (
-            "Milksync common-original spectrograms measured a stable content clock across "
+            "Milksync cross-language sound events measured a stable content clock across "
             "multiple sections; editorial steps remain in the piecewise synchronization map"
+            if event_mode
+            else (
+                "Milksync common-original spectrograms measured a stable content clock across "
+                "multiple sections; editorial steps remain in the piecewise synchronization map"
+            )
         )
 
     def synchronize(
@@ -336,7 +408,7 @@ class MilksyncAdapter:
         # The bundled engine invokes canonical tool names internally. Private per-job
         # shims make configured absolute binaries authoritative without touching the
         # process-wide environment or using a shared temporary directory.
-        self._prepare_private_environment(temp_dir)
+        self._prepare_private_environment(temp_dir, config)
         self._refine_experimental_speed(
             plan,
             normal_path=normal_path,
@@ -391,7 +463,7 @@ class MilksyncAdapter:
         manual_delay_adjustment = config.adjust_delay or 0.0
         effective_delay_adjustment = manual_delay_adjustment
         LOGGER.info(
-            "Original-audio packet starts: source=%.6fs target=%.6fs "
+            "Alignment-audio packet starts: source=%.6fs target=%.6fs "
             "observed-reference-offset=%s; applied-container=%+.6fs "
             "manual=%+.6fs effective=%+.6fs",
             source_reference_start or 0.0,
@@ -438,6 +510,10 @@ class MilksyncAdapter:
             temp_dir / "milksync",
             "--sync-report",
             report,
+            "--max-cost-matrix-size",
+            str(config.milksync_max_cost_matrix_cells),
+            "--chroma-workers",
+            str(config.milksync_chroma_workers),
             "--output",
             output,
         ]
@@ -462,11 +538,22 @@ class MilksyncAdapter:
             command.append("--preserve-silence")
         if abs(effective_delay_adjustment) > 0.000_001:
             command += ["--adjust-delay", f"{effective_delay_adjustment:.9f}"]
+        if plan.alignment_mode == "cross-language-events":
+            # A translated dialogue track is not a linguistic reference.  The
+            # bundled engine therefore votes only from strong shared events
+            # (music hits, gunshots, doors, footsteps, transitions) in short
+            # windows instead of allowing long speech sections to dominate.
+            command += [
+                "--event-anchors",
+                "--acoustic-anchor-window-size",
+                str(EVENT_RETRY_ANCHOR_WINDOW),
+            ]
 
         LOGGER.info("Synchronizing %s against %s", dual_path.name, normal_path.name)
         refinement_history: list[dict[str, float | int | str]] = []
         clock_observations: list[tuple[float, float]] = []
         render_pass = 0
+        event_anchor_retry_used = plan.alignment_mode == "cross-language-events"
         while True:
             temp_option = command.index("--temp-folder")
             command[temp_option + 1] = temp_dir / f"milksync-render-{render_pass}"
@@ -484,6 +571,18 @@ class MilksyncAdapter:
             report.unlink(missing_ok=True)
             result = self.runner.run_live(command)
             if result.returncode != 0:
+                if config.experimental_dub_resync and not event_anchor_retry_used:
+                    command += [
+                        "--acoustic-anchor-window-size",
+                        str(EVENT_RETRY_ANCHOR_WINDOW),
+                    ]
+                    event_anchor_retry_used = True
+                    LOGGER.warning(
+                        "Milksync did not produce a render on its first acoustic pass; "
+                        "retrying with shorter sound-event anchor windows (%d frames)",
+                        EVENT_RETRY_ANCHOR_WINDOW,
+                    )
+                    continue
                 detail = result.stderr.strip() or result.stdout.strip()
                 raise ProcessingError(
                     f"milksync failed with status {result.returncode}: {detail[-6000:]}"
@@ -496,7 +595,137 @@ class MilksyncAdapter:
             final_shift_points = [
                 tuple(point) for point in source_report.get("audio_shift_points", [])
             ]
-            if not (plan.fps.required and config.fps_spectral_tempo_probe):
+            provisional_buckets = [
+                tuple(bucket) for bucket in source_report.get("sync_buckets", [])
+            ]
+            provisional_duration = max(
+                (plan.dual.duration - plan.dual_trim)
+                / (
+                    plan.fps.proposed_speed_factor
+                    if plan.fps.apply_speed_correction
+                    else 1.0
+                ),
+                1.0,
+            )
+            provisional_coverage = min(
+                sum(
+                    max(
+                        min(float(bucket[1]), provisional_duration)
+                        - max(float(bucket[0]), 0.0),
+                        0.0,
+                    )
+                    for bucket in provisional_buckets
+                )
+                / provisional_duration,
+                1.0,
+            )
+            provisional_anchor_strength = (
+                0.0
+                if not final_shift_points
+                else min(0.75 + len(final_shift_points) / 12.0, 1.0)
+            )
+            provisional_confidence = provisional_coverage * provisional_anchor_strength
+            if (
+                config.experimental_dub_resync
+                and not event_anchor_retry_used
+                and provisional_confidence < config.experimental_dub_resync_min_confidence
+            ):
+                command += [
+                    "--acoustic-anchor-window-size",
+                    str(EVENT_RETRY_ANCHOR_WINDOW),
+                ]
+                event_anchor_retry_used = True
+                LOGGER.warning(
+                    "Initial acoustic map has %.1f%% confidence (%d anchor(s), %.1f%% "
+                    "coverage); retrying with shorter sound-event anchor windows (%d frames)",
+                    provisional_confidence * 100,
+                    len(final_shift_points),
+                    provisional_coverage * 100,
+                    EVENT_RETRY_ANCHOR_WINDOW,
+                )
+                continue
+            if plan.fps.required and plan.alignment_mode == "cross-language-events":
+                # The preflight measures the raw source clock. Re-measure the
+                # rendered event map once so a small PAL/telecine residual does
+                # not accumulate across an episode. This remains independent
+                # of translated dialogue: ``final_shift_points`` were made by
+                # the high-energy/onset event pass above.
+                event_config = _event_tempo_config(config)
+                residual = estimate_spectral_tempo(final_shift_points, event_config)  # type: ignore[arg-type]
+                residual["alignment_mode"] = plan.alignment_mode
+                residual["render_pass"] = render_pass
+                residual["applied_speed_factor"] = (
+                    plan.fps.proposed_speed_factor if plan.fps.apply_speed_correction else 1.0
+                )
+                plan.fps.validation["cross_language_event_post_map"] = residual
+                if not residual["reliable"]:
+                    LOGGER.warning(
+                        "Cross-language event post-map speed check is inconclusive: %s; "
+                        "keeping the current event map",
+                        residual.get("reason", "no further detail"),
+                    )
+                    break
+                residual_factor = float(residual["speed_factor"])
+                target_duration = max(plan.normal.duration - plan.normal_trim, 1.0)
+                projected_drift = abs(residual_factor - 1.0) * target_duration
+                residual["residual_speed_factor"] = residual_factor
+                residual["projected_drift_seconds"] = projected_drift
+                if abs(residual_factor - 1.0) <= max(config.fps_speed_ratio_tolerance, 0.002):
+                    break
+                if render_pass >= 1:
+                    LOGGER.warning(
+                        "Cross-language event map still projects %.3fs of clock drift after "
+                        "one bounded refinement; keeping the current map for review",
+                        projected_drift,
+                    )
+                    break
+                previous_factor = plan.fps.proposed_speed_factor
+                corrected_factor, correction_method = next_spectral_speed_factor(
+                    previous_factor,
+                    residual_factor,
+                    clock_observations,
+                    damping=config.fps_spectral_refinement_damping,
+                )
+                if abs(corrected_factor - 1.0) > event_config.fps_spectral_max_speed_adjustment:
+                    LOGGER.warning(
+                        "Cross-language event correction %.9f exceeds the %.1f%% bound; "
+                        "keeping the current map",
+                        corrected_factor,
+                        event_config.fps_spectral_max_speed_adjustment * 100,
+                    )
+                    break
+                clock_observations.append((previous_factor, residual_factor - 1.0))
+                refinement_history.append(
+                    {
+                        "render_pass": render_pass,
+                        "previous_speed_factor": previous_factor,
+                        "residual_speed_factor": residual_factor,
+                        "projected_drift_seconds": projected_drift,
+                        "refined_speed_factor": corrected_factor,
+                        "correction_method": f"cross-language-events-{correction_method}",
+                    }
+                )
+                plan.fps.proposed_speed_factor = corrected_factor
+                plan.fps.detected_speed_factor = corrected_factor
+                plan.fps.apply_speed_correction = abs(corrected_factor - 1.0) > 0.000_001
+                plan.fps.reason = (
+                    "Cross-language event anchors found residual linear clock drift; "
+                    "rerendering once with a bounded correction"
+                )
+                render_pass += 1
+                LOGGER.warning(
+                    "Cross-language event anchors project %.3fs of residual drift; "
+                    "refining content clock %.9f -> %.9f",
+                    projected_drift,
+                    previous_factor,
+                    corrected_factor,
+                )
+                continue
+            if not (
+                plan.fps.required
+                and config.fps_spectral_tempo_probe
+                and plan.alignment_mode == "common-original"
+            ):
                 break
 
             residual = estimate_spectral_tempo(final_shift_points, config)  # type: ignore[arg-type]
@@ -527,17 +756,15 @@ class MilksyncAdapter:
                 plan.fps.validation.get("telecine_acoustic_preflight")
             )
             if not residual["reliable"]:
-                if acoustic_tvrip_fallback:
-                    residual["fallback_accepted"] = True
-                    residual["reason"] = (
-                        f"{residual.get('reason')}; telecine TVRip output remains subject "
-                        "to per-segment common-original validation"
-                    )
-                    break
-                raise ProcessingError(
+                residual["fallback_accepted"] = True
+                residual["fallback_mode"] = "keep-rendered-piecewise-map"
+                residual["reason"] = (
                     "Experimental spectral post-sync validation was inconclusive: "
-                    f"{residual.get('reason')}"
+                    f"{residual.get('reason')}; keeping the completed Milksync map without "
+                    "claiming an independently measured content clock"
                 )
+                LOGGER.warning("%s", residual["reason"])
+                break
 
             # A 29.97fps TV recording is sometimes a real-time telecine of a
             # 23.976fps master, but it can also be a genuinely slower program

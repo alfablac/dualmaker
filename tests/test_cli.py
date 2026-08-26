@@ -1,16 +1,27 @@
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 import unittest
 from pathlib import Path
 
 from click.testing import CliRunner
 
-from dualmaker.cli import main
+from dualmaker.cli import _TerminalLogFormatter, main
 
 
 class CliTests(unittest.TestCase):
+    def test_terminal_warning_formatter_uses_yellow_when_color_is_enabled(self) -> None:
+        record = logging.LogRecord(
+            "dualmaker", logging.WARNING, __file__, 1, "Anchor evidence is weak", (), None
+        )
+        self.assertIn("\x1b[33mWARNING: Anchor evidence is weak", _TerminalLogFormatter(color=True).format(record))
+        self.assertEqual(
+            _TerminalLogFormatter(color=False).format(record),
+            "WARNING: Anchor evidence is weak",
+        )
+
     def test_help_documents_primary_forms(self) -> None:
         result = CliRunner().invoke(main, ["--help"])
         self.assertEqual(result.exit_code, 0, result.output)
@@ -21,6 +32,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("--refresh-config", result.output)
         self.assertIn("--original-track", result.output)
         self.assertIn("--allow-experimental-fps-sync", result.output)
+        self.assertIn("--experimental-dub-resync", result.output)
+        self.assertIn("--experimental-dub-resync-min-confidence", result.output)
+        self.assertIn("--milksync-max-threads", result.output)
+        self.assertIn("--milksync-max-cost-matrix-cells", result.output)
         self.assertIn("--fps-validation-position", result.output)
         self.assertIn("--tvrip FILE", result.output)
         self.assertIn("--allow-tvrip-segment-sync", result.output)

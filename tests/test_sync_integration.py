@@ -9,6 +9,7 @@ from pathlib import Path
 
 from dualmaker.sync.milksync import (
     Video,
+    _stable_event_shift_points,
     extract_and_sync_audio,
     turn_audio_shift_points_to_audio_segments,
 )
@@ -17,6 +18,40 @@ TOOLS = ("ffmpeg", "ffprobe", "mediainfo")
 
 
 class SyncBucketUnitTests(unittest.TestCase):
+    def test_cross_language_events_need_local_transient_agreement(self) -> None:
+        """A repeated cue cannot become a long false synchronization bucket."""
+
+        points = _stable_event_shift_points(
+            [
+                # Three independent sharp peaks corroborate the first offset.
+                (100.0, 98.8, 1.2, 0.95),
+                (106.0, 104.8, 1.2, 0.89),
+                (112.0, 110.8, 1.2, 0.91),
+                # This is a plausible-looking but isolated recurring music
+                # phrase. It must never create a 50-second audio segment.
+                (150.0, 129.0, 21.0, 0.99),
+                # A later cut is retained only after another local group.
+                (240.0, 230.0, 10.0, 0.92),
+                (247.0, 237.0, 10.0, 0.90),
+                (254.0, 244.0, 10.0, 0.94),
+            ]
+        )
+
+        self.assertEqual(len(points), 2)
+        self.assertAlmostEqual(points[0][2], 1.2)
+        self.assertAlmostEqual(points[1][2], 10.0)
+
+    def test_cross_language_events_reject_isolated_loud_matches(self) -> None:
+        points = _stable_event_shift_points(
+            [
+                (100.0, 96.0, 4.0, 1.0),
+                (200.0, 190.0, 10.0, 1.0),
+                (300.0, 270.0, 30.0, 1.0),
+            ]
+        )
+
+        self.assertEqual(points, [])
+
     def test_crossed_anchor_cannot_create_a_reverse_audio_bucket(self) -> None:
         points = [
             (0.0, 0.0, 0.0),

@@ -36,6 +36,7 @@ BOOL_FIELDS = {
     "trim_recap",
     "end_trim",
     "reconcile_av",
+    "experimental_dub_resync",
     "allow_experimental_fps_sync",
     "fps_adaptive_anchors",
     "fps_spectral_tempo_probe",
@@ -76,6 +77,9 @@ INT_LIST_FIELDS = {"dual_audio_ids", "normal_audio_ids"}
 INT_FIELDS = {
     "end_tolerance_ms",
     "av_tolerance_ms",
+    "milksync_max_threads",
+    "milksync_chroma_workers",
+    "milksync_max_cost_matrix_cells",
     "minimum_mkvmerge_version",
     "tvrip_max_segments",
     "fps_anchor_sample_count",
@@ -89,6 +93,7 @@ FLOAT_FIELDS = {
     "recap_window",
     "adjust_delay",
     "audio_selection_margin",
+    "experimental_dub_resync_min_confidence",
     "dub_gap_min_seconds",
     "dub_gap_min_coverage",
     "fps_max_drift_seconds",
@@ -190,6 +195,11 @@ CONFIG_SETTING_COMMENTS = {
     "features.end_trim": "Trim final video only when MediaInfo and ffprobe agree it outlasts selected audio.",
     "features.reconcile_av": "Compare video timelines and correct one stable shared audio/video residual.",
     "features.av_tolerance_ms": "Ignore measured shared A/V residuals no larger than this many milliseconds.",
+    "features.experimental_dub_resync": "Experimentally import a DUAL-source dub onto the master video using common-original acoustic anchors; enabled by default.",
+    "features.experimental_dub_resync_min_confidence": "Map confidence below which dualmaker retries with shorter sound-event windows and records an import warning.",
+    "features.milksync_max_threads": "Maximum native numerical threads allowed inside one Milksync process; applied to OpenBLAS, OpenMP, MKL, and Numba.",
+    "features.milksync_chroma_workers": "Concurrent audio-chroma extraction workers inside Milksync; lower values reduce CPU and memory pressure.",
+    "features.milksync_max_cost_matrix_cells": "Maximum dense DTW cost-matrix cells per Milksync slice; lower values reduce memory and increase slicing.",
     "features.allow_experimental_fps_sync": "Require explicit consent before attempting a compatible different-FPS synchronization.",
     "features.compatible_fps_pairs": "Rational frame-rate pairs allowed in experimental mode, written as SOURCE=MASTER.",
     "features.fps_max_drift_seconds": "Maximum beginning/middle/end experimental FPS validation error.",
@@ -414,6 +424,11 @@ def _default_config_document() -> dict[str, Any]:
             "end_trim": config.end_trim,
             "reconcile_av": config.reconcile_av,
             "av_tolerance_ms": config.av_tolerance_ms,
+            "experimental_dub_resync": config.experimental_dub_resync,
+            "experimental_dub_resync_min_confidence": config.experimental_dub_resync_min_confidence,
+            "milksync_max_threads": config.milksync_max_threads,
+            "milksync_chroma_workers": config.milksync_chroma_workers,
+            "milksync_max_cost_matrix_cells": config.milksync_max_cost_matrix_cells,
             "allow_experimental_fps_sync": config.allow_experimental_fps_sync,
             "compatible_fps_pairs": list(config.compatible_fps_pairs),
             "fps_max_drift_seconds": config.fps_max_drift_seconds,
@@ -902,6 +917,14 @@ def validate_configuration(
         problems.append("fps_segmented_min_post_map_anchors must be at least 2")
     if config.fps_segmented_min_post_map_span_seconds <= 0:
         problems.append("fps_segmented_min_post_map_span_seconds must be positive")
+    if not 0 <= config.experimental_dub_resync_min_confidence <= 1:
+        problems.append("experimental_dub_resync_min_confidence must be between 0 and 1")
+    if config.milksync_max_threads < 1:
+        problems.append("milksync_max_threads must be at least 1")
+    if config.milksync_chroma_workers < 1:
+        problems.append("milksync_chroma_workers must be at least 1")
+    if config.milksync_max_cost_matrix_cells < 1_000_000:
+        problems.append("milksync_max_cost_matrix_cells must be at least 1000000")
     if len(config.fps_validation_positions) < 3 or any(
         position <= 0 or position >= 1 for position in config.fps_validation_positions
     ):

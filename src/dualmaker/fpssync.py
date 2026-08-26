@@ -846,19 +846,7 @@ def analyze_fps_timing(
             )
             selected_strategy = "segmented"
             decision.validation["segmented_anchor_mapping"] = True
-        else:
-            local_summary = (
-                ", ".join(f"{name}={len(item.samples or [])}" for name, item in local.items())
-            )
-            adaptive_summary = ", ".join(
-                f"{name}={item.accepted_anchor_count} ordered anchors"
-                for name, item in discovery.items()
-            ) or "adaptive index unavailable"
-            raise ProcessingError(
-                "Experimental FPS analysis was inconclusive after local and adaptive "
-                f"content-anchor search ({local_summary}; {adaptive_summary})"
-            )
-    elif selected is None:
+    if selected is None:
         local_summary = ", ".join(
             f"{name}={len(item.samples or [])}" for name, item in local.items()
         )
@@ -866,10 +854,36 @@ def analyze_fps_timing(
             f"{name}={item.accepted_anchor_count} ordered anchors"
             for name, item in discovery.items()
         ) or "adaptive index unavailable"
-        raise ProcessingError(
-            "Experimental FPS analysis was inconclusive after local and adaptive "
-            f"content-anchor search ({local_summary}; {adaptive_summary})"
-        )
+        fallback_candidates = [
+            (label, hypothesis, "local") for label, hypothesis in local.items()
+        ] + [
+            (label, hypothesis, "adaptive") for label, hypothesis in discovery.items()
+        ]
+        if fallback_candidates:
+            selected_label, selected, fallback_origin = max(
+                fallback_candidates,
+                key=lambda item: selection_score(item[0], item[1]),
+            )
+            selected_strategy = f"best-effort-{fallback_origin}"
+        else:
+            # The local hypotheses are normally always present. Keep a
+            # deterministic, source-agnostic fallback for a decoder failure
+            # before even one comparison window could be analyzed.
+            selected_label = "container_fps_ratio"
+            selected = _Hypothesis(speed_factor=container_speed_factor)
+            selected_strategy = "best-effort-container"
+        decision.validation["best_effort_fps_fallback"] = {
+            "enabled": True,
+            "reason": (
+                "Experimental FPS analysis was inconclusive after local and adaptive "
+                f"content-anchor search ({local_summary}; {adaptive_summary})"
+            ),
+            "local_summary": local_summary,
+            "adaptive_summary": adaptive_summary,
+            "selected_hypothesis": selected_label,
+            "selected_strategy": selected_strategy,
+            "selected_speed_factor": selected.speed_factor,
+        }
 
     assert selected is not None and selected_label is not None
     decision.proposed_speed_factor = selected.speed_factor
@@ -902,7 +916,13 @@ def analyze_fps_timing(
             "local_visual_samples": len(real_time.samples or []) if real_time else 0,
             "nominated_audio_clocks": [label for label, _ in duration_candidates],
         }
-    if selected_strategy == "telecine-acoustic-preflight":
+    if selected_strategy.startswith("best-effort-"):
+        decision.reason = (
+            "Content-anchor evidence was inconclusive; continuing with the strongest "
+            f"available {selected_strategy.removeprefix('best-effort-')} hypothesis "
+            "for manual review"
+        )
+    elif selected_strategy == "telecine-acoustic-preflight":
         decision.reason = (
             "Visual FPS anchors were inconclusive for a 29.97/23.976 telecine candidate; "
             "continuing at real time only for explicit TVRip acoustic and per-segment validation"
@@ -1120,8 +1140,11 @@ def validate_fps_timeline(
             if maximum_error is not None
             else f"found {len(samples)}/{minimum_samples} post-map video matches"
         )
-        raise ProcessingError(
-            "Experimental FPS validation failed: synchronized shared-audio/video evidence was "
-            f"insufficient ({detail}; allowed error {maximum_drift:.3f}s)"
+        result["reason"] = (
+            "Synchronized shared-audio/video evidence was insufficient: "
+            f"{detail}; allowed error {maximum_drift:.3f}s"
         )
+        result["warnings"] = [
+            "Keeping the best available experimental synchronization map for manual review"
+        ]
     return result

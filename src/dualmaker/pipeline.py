@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -9,11 +10,17 @@ from pathlib import Path
 
 from .avsync import AVTimelineDecision, reconcile_av_timeline
 from .defaults import DEFAULT_TAG
-from .errors import AmbiguousPairError, DualMakerError, TVRipValidationError, UserCancelledError
+from .errors import (
+    AmbiguousPairError,
+    DualMakerError,
+    TVRipValidationError,
+    UserCancelledError,
+)
 from .fpssync import analyze_fps_timing, validate_fps_timeline
 from .matching import (
     collect_pair_candidates,
     discover_mkvs,
+    infer_untagged_avi_dub_language,
     require_explicit_pair,
     require_explicit_tvrip_pair,
 )
@@ -29,7 +36,7 @@ from .sidecars import (
     sidecar_languages_from_overrides,
 )
 from .sync import MilksyncAdapter
-from .trim import trim_start_copy
+from .trim import remux_avi_to_mkv, trim_start_copy
 from .tvrip import (
     apply_tvrip_audio_policy,
     approve_dub_gap_report,
@@ -40,6 +47,128 @@ from .tvrip import (
 )
 
 LOGGER = logging.getLogger("dualmaker")
+
+
+def _experimental_dub_resync_assessment(
+    plan: JobPlan,
+    sync,
+    av_timeline: AVTimelineDecision,
+) -> dict[str, object]:
+    """Summarize whether a DUAL-source dub has enough mapped evidence.
+
+    Milksync supplies the actual acoustic alignment. This assessment makes the
+    experimental import decision inspectable: a complete constant map supports
+    a fixed delay, while several buckets/offsets expose edit-aware placement.
+    """
+
+    imported_dubs = [
+        selection for selection in plan.resolved_dubs if selection.source == "dual"
+    ]
+    anchors = [
+        (float(target), float(source), float(offset))
+        for target, source, offset in sync.shift_points
+        if all(math.isfinite(float(value)) for value in (target, source, offset))
+    ]
+    offsets = [point[2] for point in anchors]
+    offset_spread = max(offsets) - min(offsets) if offsets else None
+    constant_offset = bool(
+        offset_spread is not None and offset_spread <= 0.05
+    )
+    coverage = min(max(float(sync.sync_coverage or 0.0), 0.0), 1.0)
+    # One complete, stationary map can prove a fixed release offset. Additional
+    # distributed anchors increase confidence in a segmented/edit-aware map.
+    anchor_strength = 0.0 if not anchors else min(0.75 + len(anchors) / 12.0, 1.0)
+    confidence = coverage * anchor_strength
+    correction_segments = [
+        {
+            "source_start": max(float(start), 0.0),
+            "source_end": min(float(end), plan.dual.duration),
+            "target_start": max(float(start) + float(offset), 0.0),
+            "target_end": min(float(end) + float(offset), plan.normal.duration),
+            "offset_seconds": float(offset),
+        }
+        for start, end, offset in sync.sync_buckets
+        if float(end) > float(start) and math.isfinite(float(offset))
+    ]
+    video_scores = [sample.score for sample in av_timeline.samples]
+    video_confirmation = (
+        sum(video_scores) / len(video_scores) if video_scores else None
+    )
+    video_map_errors: list[float] = []
+    if plan.alignment_mode == "cross-language-events":
+        # A high-scoring visual match is independent of either language.  Use
+        # it as a safety check on the acoustic event map: a single recurring
+        # musical cue must not be allowed to create a 40-second audio bucket
+        # merely because the map also has good nominal coverage.
+        for sample in av_timeline.samples:
+            if sample.score < 0.80:
+                continue
+            active_offset = anchors[0][2] if anchors else 0.0
+            for _target, source, offset in anchors:
+                if source > sample.source_time:
+                    break
+                active_offset = offset
+            video_map_errors.append(active_offset - sample.video_delay)
+    maximum_video_map_error = max((abs(error) for error in video_map_errors), default=None)
+    video_map_consistent = (
+        maximum_video_map_error is None or maximum_video_map_error <= 1.0
+    )
+    mode = "constant-offset" if constant_offset else "segmented-or-drifting"
+    if not imported_dubs:
+        reason = "No selected dub is imported from the DUAL source"
+    elif not anchors:
+        reason = "Milksync produced no finite acoustic anchors"
+    elif coverage <= 0:
+        reason = "Milksync did not map any usable source-to-master duration"
+    elif not video_map_consistent:
+        reason = (
+            "Cross-language acoustic anchors conflict with independently matched video "
+            f"by as much as {maximum_video_map_error:.3f}s; retaining the result only "
+            "for manual review"
+        )
+        # Coverage measures the amount of generated audio, not whether those
+        # buckets point at the right scene.  A visual contradiction therefore
+        # caps experimental confidence even if a permissive acoustic matcher
+        # reported many anchors.
+        confidence = min(confidence, 0.20)
+    else:
+        reason = (
+            f"{len(anchors)} {plan.alignment_mode.replace('-', ' ')} acoustic anchor(s), "
+            f"{coverage:.1%} mapped "
+            f"coverage, and {mode} timing"
+        )
+    return {
+        "enabled": True,
+        "alignment_mode": plan.alignment_mode,
+        "required": bool(imported_dubs),
+        "master_video": str(plan.normal.path),
+        "dub_source": str(plan.dual.path),
+        "imported_dubs": [selection.label for selection in imported_dubs],
+        "mode": mode,
+        "anchor_count": len(anchors),
+        "anchor_points": [
+            {
+                "target_seconds": target,
+                "source_seconds": source,
+                "offset_seconds": offset,
+            }
+            for target, source, offset in anchors
+        ],
+        "offset_range_seconds": (
+            {"minimum": min(offsets), "maximum": max(offsets), "spread": offset_spread}
+            if offsets
+            else None
+        ),
+        "correction_segments": correction_segments,
+        "coverage": coverage,
+        "anchor_strength": anchor_strength,
+        "confidence": confidence,
+        "video_confirmation_score": video_confirmation,
+        "video_confirmation_reliable": av_timeline.reliable,
+        "video_map_consistent": video_map_consistent,
+        "video_map_maximum_error_seconds": maximum_video_map_error,
+        "reason": reason,
+    }
 
 
 def _resolve_pair_sidecars(candidate, config: DualMakerConfig):
@@ -123,8 +252,22 @@ def process_job(
     try:
         normal_path = plan.normal.path
         dual_path = plan.dual.path
+        if normal_path.suffix.lower() == ".avi":
+            notify("Losslessly remuxing AVI master to MKV")
+            normal_path = remux_avi_to_mkv(
+                normal_path, work_dir / "normal-source-remuxed.mkv", runner=runner
+            )
+        if dual_path.suffix.lower() == ".avi":
+            notify("Losslessly remuxing AVI dub source to MKV")
+            dual_path = remux_avi_to_mkv(
+                dual_path, work_dir / "dual-source-remuxed.mkv", runner=runner
+            )
         recap_report: dict[str, object] = {"enabled": config.trim_recap, "applied": False}
-        if config.trim_recap and plan.source_kind != "tvrip":
+        if (
+            config.trim_recap
+            and plan.source_kind != "tvrip"
+            and plan.alignment_mode == "common-original"
+        ):
             notify("Analyzing opening recap")
             decision = choose_recap_trim(
                 normal_path,
@@ -173,6 +316,15 @@ def process_job(
                 "applied": False,
                 "reason": "TVRip openings/recaps are classified by segmented synchronization",
             }
+        elif plan.alignment_mode == "cross-language-events":
+            recap_report = {
+                "enabled": False,
+                "applied": False,
+                "reason": (
+                    "Recap trimming requires common-language dialogue; cross-language "
+                    "event anchors retain the complete source timeline"
+                ),
+            }
 
         analysis_duration = max(
             min(
@@ -205,6 +357,15 @@ def process_job(
                     else None
                 ),
             )
+            fps_fallback = plan.fps.validation.get("best_effort_fps_fallback")
+            if isinstance(fps_fallback, dict) and fps_fallback.get("enabled"):
+                LOGGER.warning(
+                    "Experimental FPS analysis is inconclusive; continuing with the "
+                    "best available %s hypothesis (speed %.9f): %s",
+                    fps_fallback.get("selected_strategy", "fallback"),
+                    float(fps_fallback.get("selected_speed_factor", 1.0)),
+                    fps_fallback.get("reason", "no further detail"),
+                )
             analysis_duration = max(
                 min(
                     (plan.dual.duration - plan.dual_trim)
@@ -218,7 +379,11 @@ def process_job(
                 1.0,
             )
 
-        notify("Comparing original audio")
+        notify(
+            "Comparing cross-language sound events"
+            if plan.alignment_mode == "cross-language-events"
+            else "Comparing original audio"
+        )
         synchronizer = MilksyncAdapter(runner)
         sync = synchronizer.synchronize(
             plan,
@@ -298,6 +463,42 @@ def process_job(
                     )
                 else:
                     LOGGER.warning("A/V timeline reconciliation skipped: %s", av_timeline.reason)
+        dub_resync = _experimental_dub_resync_assessment(plan, sync, av_timeline)
+        dub_resync["minimum_confidence"] = config.experimental_dub_resync_min_confidence
+        if dub_resync["required"]:
+            confidence = float(dub_resync["confidence"])
+            trusted = confidence >= config.experimental_dub_resync_min_confidence
+            dub_resync["accepted"] = True
+            dub_resync["trusted"] = trusted
+            LOGGER.info(
+                "Experimental dubbed-audio resync: %s; confidence %.1f%% "
+                "(minimum %.1f%%)",
+                dub_resync["reason"],
+                confidence * 100,
+                config.experimental_dub_resync_min_confidence * 100,
+            )
+            LOGGER.debug(
+                "Experimental dubbed-audio anchors: %s; correction segments: %s",
+                dub_resync["anchor_points"],
+                dub_resync["correction_segments"],
+            )
+            if not trusted:
+                evidence_name = (
+                    "the cross-language event-anchor pass"
+                    if plan.alignment_mode == "cross-language-events"
+                    else "the shorter sound-event anchor retry"
+                )
+                warning = (
+                    "Dubbed-audio resync remains below the configured confidence after "
+                    f"{evidence_name}; retaining the best available "
+                    f"map (confidence {confidence:.1%}, minimum "
+                    f"{config.experimental_dub_resync_min_confidence:.1%})"
+                )
+                dub_resync["warnings"] = [warning]
+                LOGGER.warning("%s", warning)
+        else:
+            dub_resync["accepted"] = True
+            dub_resync["trusted"] = True
         fps_validation = validate_fps_timeline(
             plan.fps,
             av_timeline,
@@ -311,6 +512,12 @@ def process_job(
             audio_sync_coverage=sync.sync_coverage,
             minimum_audio_coverage=config.tvrip_min_coverage,
         )
+        if plan.fps.required and not fps_validation["validated"]:
+            LOGGER.warning(
+                "Experimental FPS validation is inconclusive; keeping the best available "
+                "synchronization map for review: %s",
+                fps_validation.get("reason", "no further detail"),
+            )
         if plan.source_kind == "tvrip":
             tvrip_policy_config = _effective_tvrip_policy(config)
             notify("Validating TVRip content segments")
@@ -340,7 +547,10 @@ def process_job(
                 config=tvrip_policy_config,
                 runner=runner,
             )
-        elif config.dub_gap_fallback != "off":
+        elif (
+            config.dub_gap_fallback != "off"
+            and plan.alignment_mode == "common-original"
+        ):
             candidate_gaps = detected_master_only_intervals(
                 plan,
                 sync,
@@ -419,6 +629,7 @@ def process_job(
         validation["av_timeline"] = jsonable(av_timeline)
         validation["experimental_fps"] = jsonable(plan.fps)
         validation["experimental_fps_validation"] = fps_validation
+        validation["experimental_dub_resync"] = dub_resync
         validation["experimental_tvrip"] = jsonable(tvrip_report)
         validation["dub_gap_fallback"] = jsonable(dub_gap_report)
         validation["audio_selection"] = {
@@ -513,6 +724,8 @@ def scan_assets(
     for media_path in discover_mkvs(path, recursive=recursive, **discovery_options):
         try:
             asset = inspector.inspect(media_path)
+            if config:
+                infer_untagged_avi_dub_language(asset, config.dub_language)
             asset.identity = parse_identity(media_path)
             assets.append(asset)
         except DualMakerError as exc:
@@ -583,12 +796,17 @@ def plan_explicit(
     inspector = inspector or MediaInspector()
     normal_asset = inspector.inspect(normal)
     dual_asset = inspector.inspect(dual)
+    infer_untagged_avi_dub_language(dual_asset, config.dub_language)
     candidate = (
         require_explicit_tvrip_pair(normal_asset, dual_asset)
         if tvrip
         else require_explicit_pair(normal_asset, dual_asset)
     )
-    if config.interactive and not config.original_language:
+    if (
+        config.interactive
+        and candidate.alignment_mode == "common-original"
+        and not config.original_language
+    ):
         from .tui import select_original_language
 
         config = replace(config, original_language=select_original_language(candidate))

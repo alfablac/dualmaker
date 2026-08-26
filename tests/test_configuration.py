@@ -69,6 +69,10 @@ interface:
                 "allow_experimental_fps_sync: false",
                 target.read_text(encoding="utf-8"),
             )
+            self.assertIn(
+                "experimental_dub_resync: true",
+                target.read_text(encoding="utf-8"),
+            )
             self.assertIn("preferred_original_source: master", target.read_text(encoding="utf-8"))
             self.assertIn("subtitle_policy: prefer-master", target.read_text(encoding="utf-8"))
             self.assertIn("sidecar_dual_language: pt-BR", target.read_text(encoding="utf-8"))
@@ -178,6 +182,11 @@ color = "never"
                     "DUALMAKER_RECONCILE_AV": "false",
                     "DUALMAKER_AV_TOLERANCE_MS": "125",
                     "DUALMAKER_ALLOW_EXPERIMENTAL_FPS_SYNC": "true",
+                    "DUALMAKER_EXPERIMENTAL_DUB_RESYNC": "false",
+                    "DUALMAKER_EXPERIMENTAL_DUB_RESYNC_MIN_CONFIDENCE": "0.9",
+                    "DUALMAKER_MILKSYNC_MAX_THREADS": "3",
+                    "DUALMAKER_MILKSYNC_CHROMA_WORKERS": "2",
+                    "DUALMAKER_MILKSYNC_MAX_COST_MATRIX_CELLS": "8000000",
                     "DUALMAKER_FPS_VALIDATION_POSITIONS": "0.1,0.4,0.9",
                     "DUALMAKER_ORIGINAL_TRACK": "dual:4",
                     "DUALMAKER_SUBTITLE_POLICY": "exact-union",
@@ -191,6 +200,11 @@ color = "never"
             self.assertFalse(config.reconcile_av)
             self.assertEqual(config.av_tolerance_ms, 125)
             self.assertTrue(config.allow_experimental_fps_sync)
+            self.assertFalse(config.experimental_dub_resync)
+            self.assertEqual(config.experimental_dub_resync_min_confidence, 0.9)
+            self.assertEqual(config.milksync_max_threads, 3)
+            self.assertEqual(config.milksync_chroma_workers, 2)
+            self.assertEqual(config.milksync_max_cost_matrix_cells, 8_000_000)
             self.assertEqual(config.fps_validation_positions, (0.1, 0.4, 0.9))
             self.assertEqual(config.original_track_selector, "dual:4")
             self.assertEqual(config.subtitle_policy, "exact-union")

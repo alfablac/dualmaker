@@ -21,6 +21,18 @@ DEFAULT_RECONCILE_AV = True
 DEFAULT_AV_TOLERANCE_MS = 200
 DEFAULT_AUDIO_SELECTION_MARGIN = 0.75
 DEFAULT_SUBTITLE_POLICY = "prefer-master"
+DEFAULT_EXPERIMENTAL_DUB_RESYNC = True
+# A complete one-anchor constant map is sufficient to import a simple release
+# offset, while several distributed anchors raise the score to 1.0. Coverage
+# remains the dominant signal. A score below this threshold triggers one
+# shorter-window event-anchor retry and is retained as a report warning.
+DEFAULT_EXPERIMENTAL_DUB_RESYNC_MIN_CONFIDENCE = 0.80
+# Milksync's native numerical dependencies otherwise each choose their own
+# CPU-pool size. Bound both those pools and the dense DTW cost matrix so batch
+# jobs do not reserve one worker per host core or a large virtual address map.
+DEFAULT_MILKSYNC_MAX_THREADS = 2
+DEFAULT_MILKSYNC_CHROMA_WORKERS = 1
+DEFAULT_MILKSYNC_MAX_COST_MATRIX_CELLS = 25_000_000
 SIDECAR_SUBTITLE_EXTENSIONS = (".srt", ".ass", ".ssa", ".sub")
 SIDECAR_TEXT_OUTPUT_ENCODING = "utf-8-sig"
 SIDECAR_LEGACY_TEXT_ENCODINGS = ("cp1252", "latin-1")
@@ -232,6 +244,11 @@ CONFIG_KEYS = {
     "end_tolerance_ms",
     "reconcile_av",
     "av_tolerance_ms",
+    "experimental_dub_resync",
+    "experimental_dub_resync_min_confidence",
+    "milksync_max_threads",
+    "milksync_chroma_workers",
+    "milksync_max_cost_matrix_cells",
     "allow_experimental_fps_sync",
     "compatible_fps_pairs",
     "fps_max_drift_seconds",
@@ -362,6 +379,11 @@ CONFIG_SECTIONS = {
         "end_trim",
         "reconcile_av",
         "av_tolerance_ms",
+        "experimental_dub_resync",
+        "experimental_dub_resync_min_confidence",
+        "milksync_max_threads",
+        "milksync_chroma_workers",
+        "milksync_max_cost_matrix_cells",
         "allow_experimental_fps_sync",
         "compatible_fps_pairs",
         "fps_max_drift_seconds",
@@ -491,6 +513,11 @@ ENV_KEYS = {
     "END_TOLERANCE_MS": "end_tolerance_ms",
     "RECONCILE_AV": "reconcile_av",
     "AV_TOLERANCE_MS": "av_tolerance_ms",
+    "EXPERIMENTAL_DUB_RESYNC": "experimental_dub_resync",
+    "EXPERIMENTAL_DUB_RESYNC_MIN_CONFIDENCE": "experimental_dub_resync_min_confidence",
+    "MILKSYNC_MAX_THREADS": "milksync_max_threads",
+    "MILKSYNC_CHROMA_WORKERS": "milksync_chroma_workers",
+    "MILKSYNC_MAX_COST_MATRIX_CELLS": "milksync_max_cost_matrix_cells",
     "ALLOW_EXPERIMENTAL_FPS_SYNC": "allow_experimental_fps_sync",
     "COMPATIBLE_FPS_PAIRS": "compatible_fps_pairs",
     "FPS_MAX_DRIFT_SECONDS": "fps_max_drift_seconds",

@@ -7,7 +7,6 @@ from unittest.mock import patch
 import numpy as np
 
 from dualmaker.avsync import AVTimelineDecision, VideoMatchSample
-from dualmaker.errors import ProcessingError
 from dualmaker.fpssync import (
     _adaptive_anchor_hypothesis,
     _audio_duration_speed_candidates,
@@ -172,6 +171,50 @@ class FPSDecisionTests(unittest.TestCase):
         self.assertEqual(result.validation["selected_hypothesis"]["name"], "real_time")  # type: ignore[index]
         self.assertTrue(result.validation["telecine_acoustic_preflight"]["enabled"])  # type: ignore[index]
 
+    def test_inconclusive_fps_anchors_keep_the_strongest_hypothesis(self) -> None:
+        config = DualMakerConfig(allow_experimental_fps_sync=True)
+        decision = evaluate_fps_pair(
+            asset("master.mkv", 1000, FrameRate(24, 1)),
+            asset("dual.mkv", 800, FrameRate(30, 1)),
+            config,
+        )
+
+        def weak_hypothesis(*_args: object, speed_factor: float, **_kwargs: object) -> _Hypothesis:
+            return _Hypothesis(
+                speed_factor=speed_factor,
+                confidence=0.3 if abs(speed_factor - 1.0) < 0.000_001 else 0.2,
+                samples=[FPSMatchSample(0.5, 500, 500, 0.3)],
+            )
+
+        with (
+            patch("dualmaker.fpssync._analyze_hypothesis", side_effect=weak_hypothesis),
+            patch(
+                "dualmaker.fpssync._extract_anchor_descriptors",
+                return_value=(np.ones((3, 2), dtype=np.float32), np.ones(3, dtype=np.float32)),
+            ),
+            patch(
+                "dualmaker.fpssync._adaptive_anchor_hypothesis",
+                side_effect=weak_hypothesis,
+            ),
+        ):
+            result = analyze_fps_timing(
+                Path("dual.mkv"),
+                Path("master.mkv"),
+                duration=999,
+                source_duration=999,
+                decision=decision,
+                config=config,
+                work_dir=Path("."),
+                runner=object(),  # type: ignore[arg-type]
+                source_original_duration=800,
+                target_original_duration=1000,
+            )
+
+        fallback = result.validation["best_effort_fps_fallback"]  # type: ignore[index]
+        self.assertTrue(fallback["enabled"])
+        self.assertEqual(fallback["selected_hypothesis"], "real_time")
+        self.assertFalse(result.apply_speed_correction)
+
     def test_telecine_acoustic_fallback_defers_final_video_proof_to_tvrip_segments(self) -> None:
         decision = evaluate_fps_pair(
             asset("master.mkv", 1000, FrameRate(24000, 1001)),
@@ -328,7 +371,7 @@ class FPSDecisionTests(unittest.TestCase):
         )
         self.assertTrue(result["validated"])
 
-    def test_post_map_validation_rejects_progressive_error(self) -> None:
+    def test_post_map_validation_reports_progressive_error_without_rejecting_output(self) -> None:
         decision = evaluate_fps_pair(
             asset("master.mkv", 100, FrameRate(24, 1)),
             asset("dual.mkv", 96, FrameRate(25, 1)),
@@ -342,15 +385,18 @@ class FPSDecisionTests(unittest.TestCase):
                 VideoMatchSample(90, 88, 2.0, 0.8),
             ],
         )
-        with self.assertRaisesRegex(ProcessingError, "validation failed"):
-            validate_fps_timeline(
-                decision,
-                timeline,
-                shift_points=[(0.0, 0.0, 0.0)],
-                manual_delay=0.0,
-                timeline_adjustment_ms=0,
-                maximum_drift=0.5,
-            )
+        result = validate_fps_timeline(
+            decision,
+            timeline,
+            shift_points=[(0.0, 0.0, 0.0)],
+            manual_delay=0.0,
+            timeline_adjustment_ms=0,
+            maximum_drift=0.5,
+        )
+
+        self.assertFalse(result["validated"])
+        self.assertIn("maximum error 2.000s", result["reason"])
+        self.assertTrue(result["warnings"])
 
     def test_segmented_post_map_accepts_two_wide_audio_verified_video_matches(self) -> None:
         decision = evaluate_fps_pair(

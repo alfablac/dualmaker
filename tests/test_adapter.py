@@ -55,6 +55,101 @@ class FakeRunner:
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
+class SparseSpectralRunner(FakeRunner):
+    """Return an intentionally sparse map for both tempo probe and render."""
+
+    def run(
+        self,
+        args: list[object],
+        *,
+        check: bool = True,
+    ) -> SimpleNamespace:
+        command = tuple(str(item) for item in args)
+        report = Path(command[command.index("--sync-report") + 1])
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(
+            json.dumps({"0": {"audio_shift_points": [[0, 0, 0]]}}),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+class CrossLanguageTempoRunner(FakeRunner):
+    """Provide an event-only raw map with a PAL-speed content clock."""
+
+    def __init__(self, factor: float) -> None:
+        super().__init__()
+        self.factor = factor
+        self.preflight_command: tuple[str, ...] = ()
+        self.render_commands: list[tuple[str, ...]] = []
+
+    def run(
+        self,
+        args: list[object],
+        *,
+        check: bool = True,
+    ) -> SimpleNamespace:
+        del check
+        self.preflight_command = tuple(str(item) for item in args)
+        report = Path(self.preflight_command[self.preflight_command.index("--sync-report") + 1])
+        report.parent.mkdir(parents=True, exist_ok=True)
+        points = [
+            [source / self.factor, source, source / self.factor - source]
+            for source in range(0, 201, 20)
+        ]
+        report.write_text(
+            json.dumps({"0": {"audio_shift_points": points}}), encoding="utf-8"
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def run_live(self, args: list[object]) -> SimpleNamespace:
+        self.command = tuple(str(item) for item in args)
+        self.render_commands.append(self.command)
+        output = Path(self.command[self.command.index("--output") + 1])
+        report = Path(self.command[self.command.index("--sync-report") + 1])
+        output.touch()
+        # The rendered event map is now stationary, so its post-map tempo is
+        # one and no extra speed correction should be requested.
+        points = [[source, source, 0.0] for source in range(0, 201, 20)]
+        report.write_text(
+            json.dumps(
+                {
+                    "0": {
+                        "audio_shift_points": points,
+                        "sync_buckets": [[0, 1_000_000, 0]],
+                        "delete_buckets": [],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+class SparseCrossLanguageEventRunner(CrossLanguageTempoRunner):
+    """Return just one bounded post-render event pair."""
+
+    def run_live(self, args: list[object]) -> SimpleNamespace:
+        self.command = tuple(str(item) for item in args)
+        self.render_commands.append(self.command)
+        output = Path(self.command[self.command.index("--output") + 1])
+        report = Path(self.command[self.command.index("--sync-report") + 1])
+        output.touch()
+        report.write_text(
+            json.dumps(
+                {
+                    "0": {
+                        "audio_shift_points": [[0, 0, 0], [20, 20, 0]],
+                        "sync_buckets": [[0, 1_000_000, 0]],
+                        "delete_buckets": [],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
 class SpectralSlopeRunner(FakeRunner):
     """Report the residual slope of Milksync's rendered waveform."""
 
@@ -129,6 +224,179 @@ class TelecineLinearDriftRunner(FakeRunner):
 
 
 class AdapterMappingTests(unittest.TestCase):
+    def test_cross_language_events_relax_tempo_evidence_for_pal_speed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            master_original = Track(1, "audio", 0, language_ietf="en")
+            dual_dub = Track(1, "audio", 0, language_ietf="pt-BR")
+            master = MediaAsset(root / "master.mkv", 210, [master_original])
+            dual = MediaAsset(root / "dub.mkv", 200, [dual_dub])
+            plan = JobPlan(
+                normal=master,
+                dual=dual,
+                identity=ContentIdentity("episode", "show", season=1, episodes=(1,)),
+                output=root / "output.mkv",
+                normal_original=master_original,
+                dual_original=dual_dub,
+                dub_tracks=[dual_dub],
+                normal_subtitles=[],
+                dual_subtitles=[],
+                alignment_mode="cross-language-events",
+                fps=FPSDecision(required=True, approved=True, proposed_speed_factor=1.0),
+            )
+            runner = CrossLanguageTempoRunner(24000 / 25025)
+            with patch("dualmaker.sync.adapter.first_packet_pts", return_value=0.0):
+                MilksyncAdapter(runner).synchronize(  # type: ignore[arg-type]
+                    plan,
+                    normal_path=master.path,
+                    dual_path=dual.path,
+                    temp_dir=root / "work",
+                    config=DualMakerConfig(),
+                )
+
+            self.assertIn("--event-anchors", runner.preflight_command)
+            self.assertAlmostEqual(plan.fps.proposed_speed_factor, 24000 / 25025)
+            probe = plan.fps.validation["spectral_tempo_probe"]
+            self.assertEqual(probe["alignment_mode"], "cross-language-events")  # type: ignore[index]
+            self.assertEqual(probe["relaxed_event_evidence"]["minimum_pairs"], 4)  # type: ignore[index]
+            self.assertTrue(plan.fps.validation["cross_language_event_post_map"]["reliable"])  # type: ignore[index]
+            self.assertEqual(len(runner.render_commands), 1)
+
+    def test_cross_language_dub_uses_short_high_energy_event_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            master_original = Track(1, "audio", 0, language_ietf="en")
+            dual_dub = Track(1, "audio", 0, language_ietf="pt-BR")
+            master = MediaAsset(root / "master.mkv", 100, [master_original])
+            dual = MediaAsset(root / "dub.avi", 100, [dual_dub])
+            plan = JobPlan(
+                normal=master,
+                dual=dual,
+                identity=ContentIdentity("episode", "show", season=1, episodes=(1,)),
+                output=root / "output.mkv",
+                normal_original=master_original,
+                # This is an alignment reference only. It remains the output
+                # Portuguese dub, never an original-language output track.
+                dual_original=dual_dub,
+                dub_tracks=[dual_dub],
+                normal_subtitles=[],
+                dual_subtitles=[],
+                alignment_mode="cross-language-events",
+            )
+            runner = FakeRunner()
+            with patch("dualmaker.sync.adapter.first_packet_pts", return_value=0.0):
+                MilksyncAdapter(runner).synchronize(  # type: ignore[arg-type]
+                    plan,
+                    normal_path=master.path,
+                    dual_path=dual.path,
+                    temp_dir=root / "work",
+                    config=DualMakerConfig(fps_spectral_tempo_probe=False),
+                )
+
+            self.assertIn("--event-anchors", runner.command)
+            window = runner.command.index("--acoustic-anchor-window-size")
+            self.assertEqual(runner.command[window + 1], "96")
+
+    def test_sparse_cross_language_post_map_does_not_use_common_audio_failure_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            master_original = Track(1, "audio", 0, language_ietf="en")
+            dual_dub = Track(1, "audio", 0, language_ietf="pt-BR")
+            master = MediaAsset(root / "master.mkv", 210, [master_original])
+            dual = MediaAsset(root / "dub.mkv", 200, [dual_dub])
+            plan = JobPlan(
+                normal=master,
+                dual=dual,
+                identity=ContentIdentity("episode", "show", season=1, episodes=(1,)),
+                output=root / "output.mkv",
+                normal_original=master_original,
+                dual_original=dual_dub,
+                dub_tracks=[dual_dub],
+                normal_subtitles=[],
+                dual_subtitles=[],
+                alignment_mode="cross-language-events",
+                fps=FPSDecision(required=True, approved=True, proposed_speed_factor=1.0),
+            )
+            runner = SparseCrossLanguageEventRunner(24000 / 25025)
+            with patch("dualmaker.sync.adapter.first_packet_pts", return_value=0.0):
+                result = MilksyncAdapter(runner).synchronize(  # type: ignore[arg-type]
+                    plan,
+                    normal_path=master.path,
+                    dual_path=dual.path,
+                    temp_dir=root / "work",
+                    config=DualMakerConfig(),
+                )
+
+            self.assertTrue(result.path.is_file())
+            event_post = plan.fps.validation["cross_language_event_post_map"]
+            self.assertFalse(event_post["reliable"])  # type: ignore[index]
+            self.assertIn("1 bounded acoustic pairs", event_post["reason"])  # type: ignore[index]
+            self.assertNotIn("spectral_post_sync_validation", plan.fps.validation)
+
+    def test_sparse_spectral_probe_and_post_map_warn_but_render(self) -> None:
+        """Sparse fingerprints must not reject an explicitly approved FPS run."""
+
+        project_temp = Path.cwd() / ".test-work"
+        project_temp.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=project_temp) as directory:
+            root = Path(directory)
+            master_original = Track(1, "audio", 0, language_ietf="en")
+            dual_original = Track(2, "audio", 0, language_ietf="en")
+            master = MediaAsset(root / "master.mkv", 1446, [master_original])
+            dual = MediaAsset(root / "dual.mkv", 1414, [dual_original])
+            plan = JobPlan(
+                normal=master,
+                dual=dual,
+                identity=ContentIdentity("episode", "show", season=1, episodes=(1,)),
+                output=root / "output.mkv",
+                normal_original=master_original,
+                dual_original=dual_original,
+                dub_tracks=[],
+                normal_subtitles=[],
+                dual_subtitles=[],
+                fps=FPSDecision(
+                    required=True,
+                    approved=True,
+                    apply_speed_correction=True,
+                    proposed_speed_factor=0.96,
+                ),
+            )
+            runner = SparseSpectralRunner()
+            with patch("dualmaker.sync.adapter.first_packet_pts", return_value=0.0):
+                result = MilksyncAdapter(runner).synchronize(  # type: ignore[arg-type]
+                    plan,
+                    normal_path=master.path,
+                    dual_path=dual.path,
+                    temp_dir=root / "work",
+                    config=DualMakerConfig(),
+                )
+
+            self.assertTrue(result.path.is_file())
+            probe = plan.fps.validation["spectral_tempo_probe"]
+            post = plan.fps.validation["spectral_post_sync_validation"]
+            self.assertTrue(probe["fallback_accepted"])  # type: ignore[index]
+            self.assertTrue(post["fallback_accepted"])  # type: ignore[index]
+            self.assertIn("--framerate-speed-factor", runner.command)
+            self.assertIn("--acoustic-anchor-window-size", runner.command)
+            self.assertEqual(
+                runner.command[
+                    runner.command.index("--acoustic-anchor-window-size") + 1
+                ],
+                "96",
+            )
+            self.assertEqual(runner.environment["OPENBLAS_NUM_THREADS"], "2")
+            self.assertEqual(runner.environment["NUMBA_NUM_THREADS"], "2")
+            self.assertEqual(
+                runner.command[runner.command.index("--chroma-workers") + 1],
+                "1",
+            )
+            self.assertEqual(
+                runner.command[
+                    runner.command.index("--max-cost-matrix-size") + 1
+                ],
+                "25000000",
+            )
+
     def test_post_sync_speed_is_measured_on_the_rendered_timeline(self) -> None:
         # Milksync measures chroma after atempo, so a corrected render has a
         # unit post-render residual regardless of the tempo used to make it.

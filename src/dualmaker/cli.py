@@ -25,6 +25,7 @@ from .defaults import (
     DEFAULT_CONFLICT_POLICY,
     DEFAULT_DUB_LANGUAGE,
     DEFAULT_END_TOLERANCE_MS,
+    DEFAULT_EXPERIMENTAL_DUB_RESYNC_MIN_CONFIDENCE,
     DEFAULT_FPS_ANCHOR_CANDIDATE_COUNT,
     DEFAULT_FPS_ANCHOR_GLOBAL_COVERAGE,
     DEFAULT_FPS_ANCHOR_MIN_SEPARATION_SECONDS,
@@ -46,6 +47,9 @@ from .defaults import (
     DEFAULT_FPS_SPECTRAL_PAIR_MIN_SECONDS,
     DEFAULT_FPS_SPECTRAL_REFINEMENT_DAMPING,
     DEFAULT_FPS_SPECTRAL_SLOPE_CLUSTER_RADIUS,
+    DEFAULT_MILKSYNC_CHROMA_WORKERS,
+    DEFAULT_MILKSYNC_MAX_COST_MATRIX_CELLS,
+    DEFAULT_MILKSYNC_MAX_THREADS,
     DEFAULT_OUTPUT_FORMAT,
     DEFAULT_RECAP_WINDOW,
     DEFAULT_SUBTITLE_POLICY,
@@ -146,6 +150,11 @@ OPTION_GROUPS = {
         "end_tolerance_ms",
         "reconcile_av",
         "av_tolerance_ms",
+        "experimental_dub_resync",
+        "experimental_dub_resync_min_confidence",
+        "milksync_max_threads",
+        "milksync_chroma_workers",
+        "milksync_max_cost_matrix_cells",
         "allow_experimental_fps_sync",
         "compatible_fps_pairs",
         "fps_max_drift_seconds",
@@ -250,9 +259,32 @@ class GroupedCommand(click.Command):
                     formatter.write_dl(records)
 
 
+class _TerminalLogFormatter(logging.Formatter):
+    """Keep processing warnings as visible as the Rich job summaries."""
+
+    def __init__(self, *, color: bool) -> None:
+        super().__init__("%(levelname)s: %(message)s")
+        self.color = color
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        if self.color and record.levelno == logging.WARNING:
+            return click.style(rendered, fg="yellow")
+        return rendered
+
+
 def _configure_logging(config: DualMakerConfig) -> None:
     level = logging.ERROR if config.quiet else logging.DEBUG if config.verbose else logging.WARNING
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    color = config.color == "always" or (
+        config.color != "never"
+        and config.output_format != "plain"
+        and sys.stderr.isatty()
+    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(_TerminalLogFormatter(color=color))
+    # This is the CLI boundary: replace any inherited basicConfig handler so
+    # warning styling follows the selected --color mode consistently.
+    logging.basicConfig(level=level, handlers=[handler], force=True)
 
 
 def _result_summary(result: JobResult) -> dict[str, Any]:
@@ -460,6 +492,47 @@ def _exit_error(
     type=click.IntRange(min=0),
     default=None,
     help=f"Ignore residual A/V offsets smaller than this value (default: {DEFAULT_AV_TOLERANCE_MS} ms).",
+)
+@click.option(
+    "--experimental-dub-resync/--no-experimental-dub-resync",
+    default=None,
+    help="Import and acoustically synchronize DUAL-source dubs onto the master video (default: enabled).",
+)
+@click.option(
+    "--experimental-dub-resync-min-confidence",
+    type=click.FloatRange(min=0, max=1),
+    default=None,
+    help=(
+        "Common-audio map confidence below which to retry shorter sound-event anchors "
+        f"(default: {DEFAULT_EXPERIMENTAL_DUB_RESYNC_MIN_CONFIDENCE:g})."
+    ),
+)
+@click.option(
+    "--milksync-max-threads",
+    type=click.IntRange(min=1),
+    default=None,
+    help=(
+        "Cap native numerical threads in each Milksync process "
+        f"(default: {DEFAULT_MILKSYNC_MAX_THREADS})."
+    ),
+)
+@click.option(
+    "--milksync-chroma-workers",
+    type=click.IntRange(min=1),
+    default=None,
+    help=(
+        "Concurrent Milksync chroma extractors "
+        f"(default: {DEFAULT_MILKSYNC_CHROMA_WORKERS})."
+    ),
+)
+@click.option(
+    "--milksync-max-cost-matrix-cells",
+    type=click.IntRange(min=1_000_000),
+    default=None,
+    help=(
+        "Largest dense DTW matrix per Milksync slice; lower reduces RAM "
+        f"(default: {DEFAULT_MILKSYNC_MAX_COST_MATRIX_CELLS})."
+    ),
 )
 @click.option(
     "--allow-experimental-fps-sync/--no-allow-experimental-fps-sync",
@@ -915,6 +988,11 @@ def main(
     end_tolerance_ms: int | None,
     reconcile_av: bool | None,
     av_tolerance_ms: int | None,
+    experimental_dub_resync: bool | None,
+    experimental_dub_resync_min_confidence: float | None,
+    milksync_max_threads: int | None,
+    milksync_chroma_workers: int | None,
+    milksync_max_cost_matrix_cells: int | None,
     allow_experimental_fps_sync: bool | None,
     compatible_fps_pairs: tuple[str, ...],
     fps_max_drift_seconds: float | None,
@@ -1102,6 +1180,11 @@ def main(
         "end_tolerance_ms": end_tolerance_ms,
         "reconcile_av": reconcile_av,
         "av_tolerance_ms": av_tolerance_ms,
+        "experimental_dub_resync": experimental_dub_resync,
+        "experimental_dub_resync_min_confidence": experimental_dub_resync_min_confidence,
+        "milksync_max_threads": milksync_max_threads,
+        "milksync_chroma_workers": milksync_chroma_workers,
+        "milksync_max_cost_matrix_cells": milksync_max_cost_matrix_cells,
         "allow_experimental_fps_sync": allow_experimental_fps_sync,
         "compatible_fps_pairs": compatible_fps_pairs or None,
         "fps_max_drift_seconds": fps_max_drift_seconds,

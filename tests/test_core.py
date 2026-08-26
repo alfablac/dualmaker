@@ -7,9 +7,15 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from dualmaker.errors import AmbiguousPairError, ConfigurationError
+from dualmaker.avsync import AVTimelineDecision, VideoMatchSample
+from dualmaker.errors import AmbiguousPairError, ConfigurationError, PairingError
 from dualmaker.languages import base_language, languages_match, normalize_language
-from dualmaker.matching import discover_mkvs, find_pair_candidates
+from dualmaker.matching import (
+    discover_mkvs,
+    find_pair_candidates,
+    infer_untagged_avi_dub_language,
+    require_explicit_pair,
+)
 from dualmaker.models import DualMakerConfig, FrameRate, MediaAsset, PairCandidate, Track
 from dualmaker.mux import (
     TrackRef,
@@ -21,6 +27,7 @@ from dualmaker.mux import (
 )
 from dualmaker.naming import choose_conflict_path, make_output_basename, parse_identity
 from dualmaker.ordering import order_subtitles, preferred_portuguese_forced
+from dualmaker.pipeline import _experimental_dub_resync_assessment
 from dualmaker.planning import create_job_plan
 from dualmaker.preprocess import envelope_similarity
 from dualmaker.sidecars import (
@@ -28,6 +35,7 @@ from dualmaker.sidecars import (
     resolve_sidecar_subtitles,
     sidecar_languages_from_overrides,
 )
+from dualmaker.sync.adapter import SyncResult
 
 
 def track(
@@ -236,6 +244,111 @@ class MatchingAndPlanningTests(unittest.TestCase):
         self.assertEqual(plan.normal_original.id, 1)
         self.assertEqual(plan.dual_original.id, 4)
         self.assertEqual(plan.output.parent, Path("/output"))
+
+    def test_portuguese_only_avi_uses_cross_language_event_alignment(self) -> None:
+        legacy_dub = asset(
+            "/shows/Name.S01E01.legacy-dub.avi",
+            1800,
+            [track(0, "video", 0), track(1, "audio", 0, "und", channels=2)],
+        )
+        self.assertTrue(infer_untagged_avi_dub_language(legacy_dub, "pt-BR"))
+
+        candidates, skipped = find_pair_candidates([legacy_dub, self.normal])
+
+        self.assertFalse(skipped)
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertEqual(candidate.alignment_mode, "cross-language-events")
+        plan = create_job_plan(candidate, DualMakerConfig(output_dir=Path("/output")))
+        self.assertEqual(plan.alignment_mode, "cross-language-events")
+        self.assertEqual(plan.normal_original.effective_language, "en")
+        self.assertEqual(plan.dual_original.effective_language, "pt-BR")
+        self.assertEqual([dub.effective_language for dub in plan.dub_tracks], ["pt-BR"])
+
+    def test_explicit_translated_episode_titles_can_use_event_alignment(self) -> None:
+        legacy_dub = asset(
+            "/shows/Mulher.Bionica.S01E01.avi",
+            1800,
+            [track(0, "video", 0), track(1, "audio", 0, "und", channels=2)],
+        )
+        infer_untagged_avi_dub_language(legacy_dub, "pt-BR")
+
+        candidate = require_explicit_pair(self.normal, legacy_dub)
+
+        self.assertEqual(candidate.identity.title, self.normal.identity.title)
+        self.assertEqual(candidate.alignment_mode, "cross-language-events")
+        self.assertIn("different series titles", candidate.reasons[0])
+
+    def test_dual_dub_import_can_be_disabled_explicitly(self) -> None:
+        candidate = find_pair_candidates([self.dual, self.normal])[0][0]
+        with self.assertRaisesRegex(PairingError, "experimental_dub_resync"):
+            create_job_plan(
+                candidate,
+                DualMakerConfig(
+                    output_dir=Path("/output"),
+                    experimental_dub_resync=False,
+                ),
+            )
+
+    def test_dub_resync_assessment_reports_constant_and_segmented_map_evidence(self) -> None:
+        candidate = find_pair_candidates([self.dual, self.normal])[0][0]
+        plan = create_job_plan(candidate, DualMakerConfig(output_dir=Path("/output")))
+        sync = SyncResult(
+            path=Path("/tmp/synchronized.mkv"),
+            report_path=Path("/tmp/sync-map.json"),
+            shift_points=[
+                (10.0, 8.0, 2.0),
+                (500.0, 498.0, 2.0),
+                (1000.0, 998.0, 2.0),
+            ],
+            sync_buckets=[(0.0, 600.0, 2.0), (600.0, 1_000_000.0, 2.0)],
+            sync_coverage=0.95,
+        )
+
+        assessment = _experimental_dub_resync_assessment(
+            plan,
+            sync,
+            AVTimelineDecision(),
+        )
+
+        self.assertTrue(assessment["required"])
+        self.assertEqual(assessment["mode"], "constant-offset")
+        self.assertEqual(assessment["anchor_count"], 3)
+        self.assertAlmostEqual(float(assessment["confidence"]), 0.95)
+        self.assertEqual(len(assessment["correction_segments"]), 2)
+
+    def test_cross_language_assessment_rejects_event_map_that_conflicts_with_video(self) -> None:
+        legacy_dub = asset(
+            "/shows/Name.S01E01.legacy-dub.avi",
+            1800,
+            [track(0, "video", 0), track(1, "audio", 0, "und", channels=2)],
+        )
+        infer_untagged_avi_dub_language(legacy_dub, "pt-BR")
+        candidate = find_pair_candidates([legacy_dub, self.normal])[0][0]
+        plan = create_job_plan(candidate, DualMakerConfig(output_dir=Path("/output")))
+        sync = SyncResult(
+            path=Path("/tmp/synchronized.mkv"),
+            report_path=Path("/tmp/sync-map.json"),
+            shift_points=[(0.0, 0.0, 1.0), (340.0, 300.0, 40.0)],
+            sync_buckets=[(0.0, 1_000_000.0, 40.0)],
+            sync_coverage=0.95,
+        )
+        timeline = AVTimelineDecision(
+            samples=[
+                VideoMatchSample(
+                    target_time=320.0,
+                    source_time=320.0,
+                    video_delay=1.0,
+                    score=0.95,
+                )
+            ]
+        )
+
+        assessment = _experimental_dub_resync_assessment(plan, sync, timeline)
+
+        self.assertFalse(assessment["video_map_consistent"])
+        self.assertAlmostEqual(float(assessment["confidence"]), 0.20)
+        self.assertIn("conflict", str(assessment["reason"]).lower())
 
     def test_higher_quality_dual_original_can_beat_master_preference(self) -> None:
         self.normal.audio_tracks[0].codec_id = "A_EAC3"
