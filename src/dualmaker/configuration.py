@@ -274,7 +274,7 @@ CONFIG_SETTING_COMMENTS = {
     "tvrip.tvrip_acoustic_segment_require_proof": "Fail closed when an interval lacks local telecine proof: replace only that interval with the configured master fallback instead of retaining unproven dub audio. Matching silence remains mapped; one-sided or unrelated audio is replaced around its probe.",
     "interface.output_format": "Terminal output: rich for formatted human output, plain, or json for scripts.",
     "interface.color": "Color policy for human terminal output.",
-    "interface.progress": "Show progress indicators in non-interactive human terminal output.",
+    "interface.progress": "Show progress indicators in human terminal output.",
     "interface.quiet": "Suppress human-oriented terminal output while retaining machine-readable reports.",
     "interface.verbose": "Include diagnostic logging; cannot be combined with quiet.",
 }

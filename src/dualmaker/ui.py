@@ -233,7 +233,7 @@ class TerminalUI:
         self.console.print(table)
 
     def progress(self, total: int) -> Progress:
-        disable = not self.enabled or not self.config.progress or self.config.interactive
+        disable = not self.enabled or not self.config.progress
         return Progress(
             SpinnerColumn(style="cyan"),
             TextColumn("[progress.description]{task.description}"),
