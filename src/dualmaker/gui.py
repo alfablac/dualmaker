@@ -178,14 +178,18 @@ class DualMakerGUI:
         self.ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, columnspan=2, sticky="ew")
         self.ttk.Button(parent, text="Browse…", command=command).grid(row=row, column=3, padx=(8, 0))
 
-    def _help(self, parent: Any, row: int, column: int, key: str) -> None:
+    def _help(self, parent: Any, row: int, column: int, key: str, *, pack: bool = False) -> None:
         description = CONFIG_SETTING_COMMENTS.get(key, "This setting is documented in the generated dualmaker configuration file.")
-        self.ttk.Button(
+        button = self.ttk.Button(
             parent,
             text="?",
             width=3,
             command=lambda: self.messagebox.showinfo(key, description, parent=self.root),
-        ).grid(row=row, column=column, padx=(4, 8))
+        )
+        if pack:
+            button.pack(side="left", padx=(4, 8))
+        else:
+            button.grid(row=row, column=column, padx=(4, 8))
 
     def _entry_setting(self, parent: Any, row: int, column: int, label: str, variable: Any, key: str) -> None:
         self.ttk.Label(parent, text=label).grid(row=row, column=column, sticky="w")
@@ -203,7 +207,7 @@ class DualMakerGUI:
         frame = self.ttk.Frame(parent)
         frame.grid(row=0, column=column, sticky="w", padx=(0, 12))
         self.ttk.Checkbutton(frame, text=label, variable=variable).pack(side="left")
-        self._help(frame, 0, 1, key)
+        self._help(frame, 0, 1, key, pack=True)
 
     def _choose_folder(self) -> None:
         chosen = self.filedialog.askdirectory(initialdir=self.path_var.get() or str(Path.cwd()))
