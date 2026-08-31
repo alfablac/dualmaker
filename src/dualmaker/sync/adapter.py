@@ -17,6 +17,7 @@ from ..runner import ToolRunner
 LOGGER = logging.getLogger("dualmaker")
 TEXT_SUBTITLE_CODEC_IDS = {"S_TEXT/UTF8", "S_TEXT/ASS", "S_TEXT/SSA", "S_TEXT/WEBVTT"}
 EVENT_RETRY_ANCHOR_WINDOW = 96
+SINGLE_EVENT_VIDEO_OVERRIDE_MIN_ERROR_SECONDS = 2.0
 
 
 def _event_tempo_config(config: DualMakerConfig) -> DualMakerConfig:
@@ -42,11 +43,52 @@ def _event_tempo_config(config: DualMakerConfig) -> DualMakerConfig:
     )
 
 
+def _single_event_video_offset(
+    plan: JobPlan, shift_points: list[tuple[float, float, float]]
+) -> float | None:
+    """Return a video-derived opening offset when one event anchor is false."""
+
+    if plan.alignment_mode != "cross-language-events" or len(shift_points) != 1:
+        return None
+    speed = plan.fps.proposed_speed_factor if plan.fps.apply_speed_correction else 1.0
+    reliable = [sample for sample in plan.fps.samples if sample.score >= 0.70]
+    if not reliable:
+        return None
+    first = min(reliable, key=lambda sample: sample.target_time)
+    video_offset = first.target_time - first.source_time / max(speed, 0.000_001)
+    event_offset = float(shift_points[0][2])
+    if abs(event_offset - video_offset) < SINGLE_EVENT_VIDEO_OVERRIDE_MIN_ERROR_SECONDS:
+        return None
+    return video_offset
+
+
 def is_text_subtitle(track: Track) -> bool:
     codec_id = track.codec_id.upper()
     codec = track.codec.casefold()
     return codec_id in TEXT_SUBTITLE_CODEC_IDS or any(
         token in codec for token in ("subrip", "srt", "ass", "ssa", "webvtt")
+    )
+
+
+def _prefer_vobsub_reference(tracks: list[Track]) -> Track | None:
+    """Choose an embedded VobSub track usable as alass's subtitle reference."""
+    vobsubs = [track for track in tracks if track.codec_id.casefold() == "s_vobsub"]
+    if not vobsubs:
+        return None
+    return next(
+        (track for track in vobsubs if track.effective_language.casefold().startswith("en")),
+        vobsubs[0],
+    )
+
+
+def _prefer_text_reference(tracks: list[Track]) -> Track | None:
+    """Choose an embedded English text subtitle as an alass reference."""
+    text_tracks = [track for track in tracks if is_text_subtitle(track)]
+    if not text_tracks:
+        return None
+    return next(
+        (track for track in text_tracks if track.effective_language.casefold().startswith("en")),
+        text_tracks[0],
     )
 
 
@@ -554,6 +596,7 @@ class MilksyncAdapter:
         clock_observations: list[tuple[float, float]] = []
         render_pass = 0
         event_anchor_retry_used = plan.alignment_mode == "cross-language-events"
+        single_event_video_override_used = False
         while True:
             temp_option = command.index("--temp-folder")
             command[temp_option + 1] = temp_dir / f"milksync-render-{render_pass}"
@@ -595,6 +638,18 @@ class MilksyncAdapter:
             final_shift_points = [
                 tuple(point) for point in source_report.get("audio_shift_points", [])
             ]
+            video_offset = _single_event_video_offset(plan, final_shift_points)
+            if video_offset is not None and not single_event_video_override_used:
+                command += ["--adjust-shift-point", f"0:0:2:{video_offset:.9f}"]
+                single_event_video_override_used = True
+                LOGGER.warning(
+                    "A lone cross-language event anchor (%+.3fs) contradicts the "
+                    "earliest reliable video anchor (%+.3fs); rerendering with the "
+                    "video-derived opening offset",
+                    float(final_shift_points[0][2]),
+                    video_offset,
+                )
+                continue
             provisional_buckets = [
                 tuple(bucket) for bucket in source_report.get("sync_buckets", [])
             ]
@@ -938,10 +993,10 @@ class MilksyncAdapter:
             codec_fallbacks=(
                 [
                     (
-                        "Different-FPS time stretching requires re-encoding synchronized "
-                        "source-side audio to one FLAC timeline; lossless intermediates prevent "
+                        "Different-FPS time stretching uses one lossless FLAC intermediate "
+                        "timeline before rendering the source audio format; this prevents "
                         "per-edit lossy encoder priming from accumulating, but object-based "
-                        "metadata may not survive"
+                        "metadata may not survive and unsupported source encoders fall back to FLAC"
                     )
                 ]
                 if plan.fps.apply_speed_correction
@@ -980,8 +1035,61 @@ class MilksyncAdapter:
         temp_dir.mkdir(parents=True, exist_ok=True)
         output_sidecars: list[SidecarSubtitle] = []
         for index, sidecar in enumerate(plan.sidecar_subtitles):
+            source_subtitle = sidecar.path
+            if sidecar.source == "dual" and plan.dual_subtitles and any(
+                not is_text_subtitle(track) for track in plan.dual_subtitles
+            ):
+                # Bitmap subtitles cannot be used as the output of an
+                # edit-aware map. If an external text replacement exists,
+                # first align it to an embedded text/VobSub reference (or the
+                # DUAL media audio). The normal Milksync pass below then maps
+                # that result onto the master.
+                alass = self.runner.which("alass")
+                if alass:
+                    alass_output = temp_dir / f"sidecar-{index}-alass{sidecar.path.suffix}"
+                    reference: Path = dual_path
+                    text_reference = _prefer_text_reference(plan.dual_subtitles)
+                    vobsub = _prefer_vobsub_reference(plan.dual_subtitles)
+                    reference_track = text_reference or vobsub
+                    if reference_track is not None:
+                        extension = ".srt" if text_reference is not None else ".idx"
+                        reference_prefix = temp_dir / f"alass-subtitle-reference{extension}"
+                        try:
+                            self.runner.run(
+                                (
+                                    "mkvextract",
+                                    "tracks",
+                                    dual_path,
+                                    f"{reference_track.id}:{reference_prefix}",
+                                )
+                            )
+                        except Exception as exc:
+                            raise ProcessingError(
+                                f"Could not extract VobSub reference for alass from {dual_path}: {exc}"
+                            ) from exc
+                        if reference_prefix.is_file():
+                            reference = reference_prefix
+                    try:
+                        self.runner.run(
+                            (alass, reference, sidecar.path, alass_output)
+                        )
+                    except Exception as exc:
+                        raise ProcessingError(
+                            f"Could not align external subtitle {sidecar.path} with alass: {exc}"
+                        ) from exc
+                    if not alass_output.is_file():
+                        raise ProcessingError(
+                            f"alass did not create an output for external subtitle {sidecar.path}"
+                        )
+                    source_subtitle = alass_output
+                else:
+                    LOGGER.warning(
+                        "alass is not installed; using Milksync's subtitle map directly "
+                        "for %s",
+                        sidecar.path,
+                    )
             normalized = self._convert_sidecar_to_utf8_bom(
-                sidecar.path,
+                source_subtitle,
                 destination=temp_dir / f"sidecar-{index}-utf8bom{sidecar.path.suffix}",
             )
             prepared = self._trim_sidecar(

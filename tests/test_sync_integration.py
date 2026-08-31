@@ -9,6 +9,7 @@ from pathlib import Path
 
 from dualmaker.sync.milksync import (
     Video,
+    _recover_confirmed_event_boundaries,
     _stable_event_shift_points,
     extract_and_sync_audio,
     turn_audio_shift_points_to_audio_segments,
@@ -51,6 +52,36 @@ class SyncBucketUnitTests(unittest.TestCase):
         )
 
         self.assertEqual(points, [])
+
+    def test_confirmed_cut_recovers_at_first_weaker_post_cut_event(self) -> None:
+        strong = _stable_event_shift_points(
+            [
+                (100.0, 99.0, 1.0, 0.9), (110.0, 109.0, 1.0, 0.9), (120.0, 119.0, 1.0, 0.9),
+                (220.0, 173.0, 47.0, 0.9), (230.0, 183.0, 47.0, 0.9), (240.0, 193.0, 47.0, 0.9),
+            ]
+        )
+        recovered = _recover_confirmed_event_boundaries(
+            [
+                (100.0, 99.0, 1.0, 0.9), (110.0, 109.0, 1.0, 0.9), (120.0, 119.0, 1.0, 0.9),
+                (170.0, 123.0, 47.0, 0.10), (185.0, 138.0, 47.0, 0.09),
+                (200.0, 150.0, 50.0, 0.95),
+                (220.0, 173.0, 47.0, 0.9), (230.0, 183.0, 47.0, 0.9), (240.0, 193.0, 47.0, 0.9),
+            ],
+            strong,
+        )
+        self.assertAlmostEqual(recovered[1][0], 170.0)
+        self.assertAlmostEqual(recovered[1][2], 47.0)
+
+    def test_weak_events_cannot_pull_an_anchor_back_by_minutes(self) -> None:
+        points = [(100.0, 99.0, 1.0), (500.0, 453.0, 47.0)]
+        recovered = _recover_confirmed_event_boundaries(
+            [
+                (150.0, 103.0, 47.0, 0.12),
+                (180.0, 133.0, 47.0, 0.11),
+            ],
+            points,
+        )
+        self.assertEqual(recovered, points)
 
     def test_crossed_anchor_cannot_create_a_reverse_audio_bucket(self) -> None:
         points = [
@@ -190,7 +221,7 @@ class SyncIntegrationTests(unittest.TestCase):
             )
             self.assertAlmostEqual(float(json.loads(probe.stdout)["format"]["duration"]), 2.0, delta=0.08)
 
-    def test_framerate_alignment_time_stretches_retained_source_audio(self) -> None:
+    def test_framerate_alignment_restores_source_ac3_properties_after_stretching(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.mkv"
@@ -206,7 +237,7 @@ class SyncIntegrationTests(unittest.TestCase):
                     "-f",
                     "lavfi",
                     "-i",
-                    "sine=frequency=440:sample_rate=48000:duration=2",
+                    "aevalsrc=sin(2*PI*440*t):s=48000:d=2:c=5.1",
                     "-map",
                     "0:v",
                     "-map",
@@ -215,6 +246,8 @@ class SyncIntegrationTests(unittest.TestCase):
                     "libx264",
                     "-c:a",
                     "ac3",
+                    "-b:a",
+                    "384k",
                     source,
                 ),
                 check=True,
@@ -235,7 +268,7 @@ class SyncIntegrationTests(unittest.TestCase):
                     "-v",
                     "error",
                     "-show_entries",
-                    "format=duration:stream=codec_name",
+                    "format=duration:stream=codec_name,channels,channel_layout,sample_rate,bit_rate",
                     "-of",
                     "json",
                     output,
@@ -247,9 +280,77 @@ class SyncIntegrationTests(unittest.TestCase):
             metadata = json.loads(probe.stdout)
             duration = float(metadata["format"]["duration"])
             self.assertAlmostEqual(duration, 2.5, delta=0.08)
-            self.assertEqual(metadata["streams"][0]["codec_name"], "flac")
+            audio = metadata["streams"][0]
+            self.assertEqual(audio["codec_name"], "ac3")
+            self.assertEqual(audio["channels"], 6)
+            self.assertEqual(audio["channel_layout"], "5.1(side)")
+            self.assertEqual(audio["sample_rate"], "48000")
+            self.assertEqual(audio["bit_rate"], "384000")
 
-    def test_framerate_piecewise_aac_uses_one_delay_free_lossless_timeline(self) -> None:
+    def test_framerate_alignment_restores_source_eac3_bitrate_after_stretching(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-eac3.mkv"
+            subprocess.run(
+                (
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=size=32x32:rate=25:duration=2",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "aevalsrc=sin(2*PI*440*t):s=48000:d=2:c=5.1",
+                    "-map",
+                    "0:v",
+                    "-map",
+                    "1:a",
+                    "-c:v",
+                    "libx264",
+                    "-c:a",
+                    "eac3",
+                    "-b:a",
+                    "1024k",
+                    source,
+                ),
+                check=True,
+            )
+            output = extract_and_sync_audio(
+                Video(source),
+                0,
+                2.5,
+                [(0.0, 0.0, 0.0)],
+                [(0.0, 2.5, 0.0)],
+                [],
+                root / "stretched-eac3.unknown",
+                framerate_align=(1.0, 0.8),
+            )
+            probe = subprocess.run(
+                (
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,channels,channel_layout,sample_rate,bit_rate",
+                    "-of",
+                    "json",
+                    output,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            audio = json.loads(probe.stdout)["streams"][0]
+            self.assertEqual(audio["codec_name"], "eac3")
+            self.assertEqual(audio["channels"], 6)
+            self.assertEqual(audio["channel_layout"], "5.1(side)")
+            self.assertEqual(audio["sample_rate"], "48000")
+            self.assertEqual(audio["bit_rate"], "1024000")
+
+    def test_framerate_piecewise_aac_uses_one_delay_free_source_codec_timeline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source-aac.mkv"
@@ -305,20 +406,20 @@ class SyncIntegrationTests(unittest.TestCase):
                 text=True,
             )
             metadata = json.loads(probe.stdout)
-            self.assertEqual(metadata["streams"][0]["codec_name"], "flac")
+            self.assertEqual(metadata["streams"][0]["codec_name"], "aac")
             self.assertAlmostEqual(float(metadata["format"]["duration"]), 4.2, delta=0.03)
             subprocess.run(
                 ("ffmpeg", "-v", "error", "-i", output, "-f", "null", "-"),
                 check=True,
             )
 
-    def test_piecewise_aac_with_inserted_silence_uses_one_decodable_flac_timeline(self) -> None:
+    def test_piecewise_aac_with_inserted_silence_uses_one_decodable_source_codec_timeline(self) -> None:
         """Do not stream-concat HE-AAC-like program packets with AAC silence.
 
         AAC streams with different AudioSpecificConfig values can both be
         labelled ``aac`` by ffprobe. Normalizing every segmented timeline
-        prevents a corrupt output that only surfaces when a later policy pass
-        tries to decode it.
+        before the final AAC encode prevents a corrupt output that only
+        surfaces when a later policy pass tries to decode it.
         """
 
         with tempfile.TemporaryDirectory() as directory:
@@ -374,7 +475,7 @@ class SyncIntegrationTests(unittest.TestCase):
                 text=True,
             )
             metadata = json.loads(probe.stdout)
-            self.assertEqual(metadata["streams"][0]["codec_name"], "flac")
+            self.assertEqual(metadata["streams"][0]["codec_name"], "aac")
             self.assertAlmostEqual(float(metadata["format"]["duration"]), 4.0, delta=0.04)
             subprocess.run(
                 ("ffmpeg", "-v", "error", "-i", output, "-f", "null", "-"),

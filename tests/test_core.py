@@ -107,6 +107,17 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(master.key, dual.key)
         self.assertEqual(master.title, "furious")
 
+    def test_walker_texas_ranger_episode_one_punctuation_variants_match(self) -> None:
+        normal = parse_identity(
+            "Walker.Texas.Ranger.S01E01.One.Riot.One.Ranger.1080p.DSNP.WEB-DL.AAC2.0.H.264-playWEB.mkv"
+        )
+        dual = parse_identity(
+            "Walker.Texas.Ranger.S01E01.One.Riot,.One.Ranger.480p.DVD-REMUX.MPEG-2.DD2.0-Fluffy.DUAL-Yatogam1.mkv"
+        )
+
+        self.assertEqual(normal.key, dual.key)
+        self.assertEqual(normal.episodes, (1,))
+
     def test_library_episode_year_and_release_episode_identity_match(self) -> None:
         dual = parse_identity(
             "Warehouse 13 (2009) - S03E01 - The New Guy "
@@ -203,6 +214,24 @@ class MatchingAndPlanningTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].normal.path, self.normal.path)
         self.assertEqual(candidates[0].shared_original_languages, ("en",))
+
+    def test_walker_texas_ranger_episode_one_is_pairable(self) -> None:
+        normal = asset(
+            "/shows/Walker.Texas.Ranger.S01E01.One.Riot.One.Ranger.1080p.DSNP.WEB-DL.AAC2.0.H.264-playWEB.mkv",
+            1800,
+            [track(0, "video", 0), track(1, "audio", 0, "en")],
+        )
+        dual = asset(
+            "/shows/Walker.Texas.Ranger.S01E01.One.Riot,.One.Ranger.480p.DVD-REMUX.MPEG-2.DD2.0-Fluffy.DUAL-Yatogam1.mkv",
+            1800,
+            [track(0, "video", 0), track(1, "audio", 0, "pt-BR"), track(2, "audio", 1, "en")],
+        )
+
+        candidates, skipped = find_pair_candidates([normal, dual])
+
+        self.assertFalse(skipped)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].identity.episodes, (1,))
 
     def test_episode_pairs_use_natural_numeric_order(self) -> None:
         """A season must display/process E2 before E10 even with unpadded names."""
@@ -519,6 +548,49 @@ class SubtitleExtractionTests(unittest.TestCase):
 
 
 class SidecarTests(unittest.TestCase):
+    def test_portuguese_sidecar_named_after_master_belongs_to_dual(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dual_path = root / "Show.S01E01.DUAL.mkv"
+            normal_path = root / "Show.S01E01.WEB-DL.mkv"
+            sidecar = root / "Show.S01E01.WEB-DL.pt-BR.srt"
+            for path in (dual_path, normal_path, sidecar):
+                path.touch()
+            identity = parse_identity(dual_path)
+            candidate = PairCandidate(
+                MediaAsset(normal_path, 10, [], identity=identity),
+                MediaAsset(dual_path, 10, [], identity=identity),
+                identity,
+                1.0,
+                ("en",),
+            )
+
+            found = discover_pair_sidecars(candidate)
+
+            self.assertEqual([(item.path, item.source) for item in found], [(sidecar, "dual")])
+
+    def test_unlabelled_pair_sidecar_ignores_other_episode_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dual_path = root / "Show.S01E01.DUAL.mkv"
+            normal_path = root / "Show.S01E01.WEB-DL.mkv"
+            sidecar = root / "portuguese-subtitles.srt"
+            other_episode = root / "Show.S01E02.srt"
+            for path in (dual_path, normal_path, sidecar, other_episode):
+                path.touch()
+            identity = parse_identity(dual_path)
+            candidate = PairCandidate(
+                MediaAsset(normal_path, 10, [], identity=identity),
+                MediaAsset(dual_path, 10, [], identity=identity),
+                identity,
+                1.0,
+                ("en",),
+            )
+
+            found = discover_pair_sidecars(candidate)
+
+            self.assertEqual([item.path for item in found], [sidecar.resolve()])
+
     def test_dual_sidecar_is_associated_and_defaults_to_portuguese_brazil(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

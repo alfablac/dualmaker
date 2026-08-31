@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dualmaker"
-version = "0.7.0"
+version = "0.8.0"
 description = "Build correctly synchronized Portuguese dual-audio MKVs from matching releases"
 readme = "README.md"
 requires-python = ">=3.11"

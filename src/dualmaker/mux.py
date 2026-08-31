@@ -11,7 +11,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from .errors import OutputConflictError, ProcessingError
-from .languages import normalize_language
+from .languages import base_language, normalize_language
 from .metadata import MediaInspector, first_packet_pts, last_packet_end
 from .models import Attachment, DualMakerConfig, JobPlan, MediaAsset, Track
 from .naming import choose_conflict_path
@@ -278,6 +278,19 @@ def _has_master_subtitle_replacement(track: Track, master_subtitles: list[Track]
     return any(
         subtitle_presentation_key(candidate) == (language, forced, accessibility)
         for candidate in master_subtitles
+    )
+
+
+def _has_dual_sidecar_replacement(track: Track, sidecars: list[object]) -> bool:
+    """Whether an external DUAL text subtitle replaces this bitmap language."""
+    language = normalize_language(track.effective_language)
+    if language == "und":
+        return False
+    return any(
+        getattr(sidecar, "source", None) == "dual"
+        and base_language(normalize_language(getattr(sidecar, "language", "und")))
+        == base_language(language)
+        for sidecar in sidecars
     )
 
 
@@ -706,6 +719,22 @@ def mux_output(
                     }
                 )
                 continue
+            if _has_dual_sidecar_replacement(track, sync.sidecar_subtitles):
+                LOGGER.warning(
+                    "Omitting DUAL PGS subtitle track %s: external text sidecar replaces "
+                    "the %s subtitle slot",
+                    track.id,
+                    track.effective_language,
+                )
+                bitmap_timing.append(
+                    {
+                        "track_id": track.id,
+                        "codec": track.codec_id or track.codec,
+                        "status": "omitted-sidecar-replacement",
+                        "reason": issue,
+                    }
+                )
+                continue
             raise ProcessingError(
                 f"PGS subtitle track {track.id} could not be synchronized: {issue}"
             )
@@ -759,6 +788,23 @@ def mux_output(
                     "track_id": track.id,
                     "codec": track.codec_id or track.codec,
                     "status": "omitted-master-replacement",
+                    "reason": issue,
+                }
+            )
+            continue
+
+        if _has_dual_sidecar_replacement(track, sync.sidecar_subtitles):
+            LOGGER.warning(
+                "Omitting DUAL bitmap subtitle track %s: external text sidecar replaces "
+                "the %s subtitle slot",
+                track.id,
+                track.effective_language,
+            )
+            bitmap_timing.append(
+                {
+                    "track_id": track.id,
+                    "codec": track.codec_id or track.codec,
+                    "status": "omitted-sidecar-replacement",
                     "reason": issue,
                 }
             )

@@ -12,6 +12,7 @@ from dualmaker.models import (
     ContentIdentity,
     DualMakerConfig,
     FPSDecision,
+    FPSMatchSample,
     JobPlan,
     MediaAsset,
     SidecarSubtitle,
@@ -20,6 +21,7 @@ from dualmaker.models import (
 from dualmaker.sync.adapter import (
     MilksyncAdapter,
     SyncResult,
+    _single_event_video_offset,
     estimate_spectral_tempo,
     next_spectral_speed_factor,
     post_sync_relative_speed,
@@ -224,6 +226,33 @@ class TelecineLinearDriftRunner(FakeRunner):
 
 
 class AdapterMappingTests(unittest.TestCase):
+    def test_single_false_event_anchor_uses_opening_video_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            master_original = Track(1, "audio", 0, language_ietf="en")
+            dual_dub = Track(1, "audio", 0, language_ietf="pt-BR")
+            plan = JobPlan(
+                normal=MediaAsset(root / "master.mkv", 100, [master_original]),
+                dual=MediaAsset(root / "dub.mkv", 100, [dual_dub]),
+                identity=ContentIdentity("episode", "show", season=1, episodes=(1,)),
+                output=root / "output.mkv",
+                normal_original=master_original,
+                dual_original=dual_dub,
+                dub_tracks=[dual_dub],
+                normal_subtitles=[],
+                dual_subtitles=[],
+                alignment_mode="cross-language-events",
+                fps=FPSDecision(
+                    apply_speed_correction=True,
+                    proposed_speed_factor=0.959040959,
+                    samples=[FPSMatchSample(0.01, 20.0, 16.0, 0.95)],
+                ),
+            )
+            self.assertAlmostEqual(
+                _single_event_video_offset(plan, [(33.4, 0.0, 33.4)]) or 0.0,
+                20.0 - 16.0 / 0.959040959,
+            )
+
     def test_cross_language_events_relax_tempo_evidence_for_pal_speed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

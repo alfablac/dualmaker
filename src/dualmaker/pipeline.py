@@ -17,6 +17,7 @@ from .errors import (
     UserCancelledError,
 )
 from .fpssync import analyze_fps_timing, validate_fps_timeline
+from .languages import base_language, normalize_language
 from .matching import (
     collect_pair_candidates,
     discover_mkvs,
@@ -25,8 +26,18 @@ from .matching import (
     require_explicit_tvrip_pair,
 )
 from .metadata import MediaInspector
-from .models import DualMakerConfig, JobPlan, JobResult, MediaAsset, PairCandidate, jsonable
+from .models import (
+    DualMakerConfig,
+    JobPlan,
+    JobResult,
+    MediaAsset,
+    PairCandidate,
+    SidecarSubtitle,
+    TVRipSyncReport,
+    jsonable,
+)
 from .mux import mux_output
+from .ocr import ocr_vobsub
 from .planning import create_job_plan
 from .preprocess import RecapDecision, choose_recap_trim
 from .runner import ToolRunner
@@ -36,6 +47,7 @@ from .sidecars import (
     sidecar_languages_from_overrides,
 )
 from .sync import MilksyncAdapter
+from .sync.adapter import is_text_subtitle
 from .trim import remux_avi_to_mkv, trim_start_copy
 from .tvrip import (
     apply_tvrip_audio_policy,
@@ -229,6 +241,46 @@ def _effective_tvrip_policy(config: DualMakerConfig) -> DualMakerConfig:
     return replace(config, tvrip_fallback=config.dub_gap_fallback)
 
 
+def _should_apply_dub_gap_fallback(plan: JobPlan, config: DualMakerConfig) -> bool:
+    """Whether a mapped master-only interval may use the selected fallback.
+
+    The fallback is driven by the rendered map, not by the language used to
+    create it.  Cross-language event maps can expose a real master-only scene
+    just as common-original maps can, and their renderer otherwise emits
+    silence for that complement.
+    """
+
+    return config.dub_gap_fallback != "off" and plan.alignment_mode in {
+        "common-original",
+        "cross-language-events",
+    }
+
+
+def _retain_cross_language_mapped_dub(report: TVRipSyncReport) -> None:
+    """Keep event-mapped dub intervals while rebuilding only map complements.
+
+    The ordinary dub-gap approval rule demands a shared original-language
+    validation for every mapped interval. A Portuguese-only source has no such
+    track, yet those intervals are already what the normal cross-language
+    renderer retains. Re-applying that stricter rule during fallback assembly
+    used to withhold the entire master-original repair and leave its gap silent.
+    """
+
+    for segment in report.segments:
+        segment.status = "accepted"
+        segment.operation = (
+            "Retained: cross-language event map; master-only complements use the "
+            "configured fallback"
+        )
+    report.source_analysis["cross_language_gap_fallback"] = {
+        "action": "retain-mapped-dub-and-rebuild-master-only-complements",
+        "reason": (
+            "No common original-language track is available for per-segment "
+            "approval; preserve the same mapped Portuguese intervals as the normal render"
+        ),
+    }
+
+
 def process_job(
     plan: JobPlan,
     config: DualMakerConfig,
@@ -262,6 +314,55 @@ def process_job(
             dual_path = remux_avi_to_mkv(
                 dual_path, work_dir / "dual-source-remuxed.mkv", runner=runner
             )
+        bitmap_tracks = [
+            track for track in plan.dual_subtitles if not is_text_subtitle(track)
+        ]
+        if bitmap_tracks:
+            target_language = base_language(
+                normalize_language(config.sidecar_dual_language or config.dub_language)
+            )
+            ocr_track = next(
+                (
+                    track
+                    for track in bitmap_tracks
+                    if base_language(normalize_language(track.effective_language))
+                    == target_language
+                    and track.codec_id.casefold() == "s_vobsub"
+                ),
+                None,
+            )
+            if ocr_track is not None:
+                notify("Checking for local OCR replacement of VobSub subtitles")
+                ocr_path = work_dir / f"ocr-track-{ocr_track.id}.srt"
+                try:
+                    ocr_vobsub(
+                        dual_path,
+                        ocr_track,
+                        ocr_path,
+                        work_dir=work_dir,
+                        runner=runner,
+                    )
+                except Exception as exc:
+                    if not any(item.source == "dual" for item in plan.sidecar_subtitles):
+                        raise
+                    LOGGER.warning(
+                        "VobSub OCR was unavailable or failed; retaining the supplied "
+                        "DUAL sidecar: %s",
+                        exc,
+                    )
+                else:
+                    plan.sidecar_subtitles = [
+                        item
+                        for item in plan.sidecar_subtitles
+                        if not (
+                            item.source == "dual"
+                            and base_language(normalize_language(item.language))
+                            == target_language
+                        )
+                    ]
+                    plan.sidecar_subtitles.append(
+                        SidecarSubtitle(ocr_path, "dual", normalize_language(ocr_track.effective_language))
+                    )
         recap_report: dict[str, object] = {"enabled": config.trim_recap, "applied": False}
         if (
             config.trim_recap
@@ -547,10 +648,7 @@ def process_job(
                 config=tvrip_policy_config,
                 runner=runner,
             )
-        elif (
-            config.dub_gap_fallback != "off"
-            and plan.alignment_mode == "common-original"
-        ):
+        elif _should_apply_dub_gap_fallback(plan, config):
             candidate_gaps = detected_master_only_intervals(
                 plan,
                 sync,
@@ -567,6 +665,8 @@ def process_job(
                     work_dir=work_dir,
                     runner=runner,
                 )
+                if plan.alignment_mode == "cross-language-events":
+                    _retain_cross_language_mapped_dub(dub_gap_report)
                 try:
                     notify("Reviewing Portuguese-dub fallback safety")
                     dub_gap_report = approve_dub_gap_report(dub_gap_report, plan, config)

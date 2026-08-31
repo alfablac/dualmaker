@@ -18,7 +18,11 @@ from dualmaker.models import (
     TVRipSegment,
     TVRipSyncReport,
 )
-from dualmaker.pipeline import _effective_tvrip_policy
+from dualmaker.pipeline import (
+    _effective_tvrip_policy,
+    _retain_cross_language_mapped_dub,
+    _should_apply_dub_gap_fallback,
+)
 from dualmaker.planning import create_job_plan
 from dualmaker.sync.adapter import SyncResult
 from dualmaker.tvrip import (
@@ -1257,6 +1261,37 @@ class DubGapFallbackTests(unittest.TestCase):
 
         review_only = DualMakerConfig(dub_gap_fallback="off")
         self.assertIs(_effective_tvrip_policy(review_only), review_only)
+
+    def test_cross_language_event_map_uses_universal_dub_gap_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self._gap_plan(Path(directory))
+            plan.alignment_mode = "cross-language-events"
+            self.assertTrue(
+                _should_apply_dub_gap_fallback(
+                    plan, DualMakerConfig(dub_gap_fallback="original")
+                )
+            )
+            self.assertFalse(
+                _should_apply_dub_gap_fallback(
+                    plan, DualMakerConfig(dub_gap_fallback="off")
+                )
+            )
+
+    def test_cross_language_rebuild_retains_mapped_dub_sections(self) -> None:
+        report = TVRipSyncReport(
+            segments=[
+                TVRipSegment(1, 0, 20, 0, 20, 0, status="rejected"),
+                TVRipSegment(2, 20, 40, 25, 45, 5, status="ambiguous"),
+            ],
+            master_only=[TVRipInterval(20, 25, "master-only", "map hole")],
+            fallback="original",
+        )
+        _retain_cross_language_mapped_dub(report)
+        self.assertEqual([segment.status for segment in report.segments], ["accepted", "accepted"])
+        self.assertEqual(
+            report.source_analysis["cross_language_gap_fallback"]["action"],
+            "retain-mapped-dub-and-rebuild-master-only-complements",
+        )
 
 
 if __name__ == "__main__":

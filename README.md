@@ -288,7 +288,8 @@ dub delay: codec priming and broken container PTS do not prove an offset from th
 The same acoustic reference map is applied to every imported Portuguese audio track and DUAL-side
 subtitle. `--adjust-delay` is an explicit manual override. Video is always stream-copied from the
 normal master. Imported audio is stream-copied when its codec and required edit boundaries allow
-it; codec fallback required for inserted silence is reported.
+it; edited timelines are rendered once back to the source format when FFmpeg supports it, with a
+reported FLAC fallback otherwise.
 
 ### Experimental DUAL-source dub resync
 
@@ -408,7 +409,9 @@ analysis approved it. This necessarily re-encodes affected audio and can discard
 lossless codec metadata; the fallback is reported. Different-FPS segments always use FLAC
 intermediates: separately encoding every edit segment to AAC/AC-3/E-AC-3 would preserve encoder
 priming at every join and create a delay that grows through the feature. The lossless segments are
-concatenated first, so no per-edit codec delay accumulates. Text subtitles are time-normalized with the
+concatenated first, then rendered once back to the source codec with its sample rate, channel layout,
+and bitrate when the local FFmpeg encoder supports it. Unsupported encoder configurations retain the
+FLAC timeline. Text subtitles are time-normalized with the
 same map. PGS timestamps are mapped display set by display set; VobSub is retained only when its
 packet timeline can be represented safely by one offset and global multiplier.
 

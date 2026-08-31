@@ -42,6 +42,21 @@ HOP_LENGTH = None
 
 SAMPLES_PATH = Path(__file__).parents[1] / 'samples'
 LOSSLESS_CODECS = ('flac', 'alac', 'truehd', 'thd')
+# FFprobe codec names and FFmpeg encoder names normally match.  These four
+# formats are the useful exceptions: the FFmpeg encoders are named after their
+# implementation or the DTS codec family rather than the demuxed codec name.
+AUDIO_ENCODER_ALIASES = {
+    'dts': 'dca',
+    'mp3': 'libmp3lame',
+    'opus': 'libopus',
+    'vorbis': 'libvorbis',
+}
+# These codecs use a target bitrate as part of their normal encoder settings.
+# Do not pass a source's measured bitrate to lossless/PCM encoders: it is not
+# a quality target for those formats and some encoders reject it outright.
+BITRATE_CONTROLLED_CODECS = {
+    'aac', 'ac3', 'dts', 'eac3', 'mp2', 'mp3', 'opus', 'vorbis', 'wmav2',
+}
 
 # Cross-language alignment needs evidence that survives a changed dialogue
 # recording and a different mix.  Continuous music can have high RMS for
@@ -51,14 +66,23 @@ LOSSLESS_CODECS = ('flac', 'alac', 'truehd', 'thd')
 # The threshold applies *after* peak isolation and mutual matching.  It can
 # therefore be comparatively lax for a low-bitrate dub without admitting a
 # continuous music bed, which has zero event strength between its transients.
-EVENT_MIN_STRENGTH = 0.20
+# Dubbed mixes often attenuate effects and room tone substantially. Keep the
+# event floor low enough to admit repeated background transients; local offset
+# voting below remains the false-match guard.
+EVENT_MIN_STRENGTH = 0.12
 EVENT_PEAK_SEPARATION_SECONDS = 0.30
 EVENT_OFFSET_QUANTUM_SECONDS = 0.25
 EVENT_LOCAL_SUPPORT_SECONDS = 18.0
-EVENT_MIN_LOCAL_SUPPORT = 3
-EVENT_MIN_LOCAL_SUPPORT_FRACTION = 0.60
-EVENT_MIN_SEGMENT_SECONDS = 18.0
-EVENT_CHROMA_CACHE_VERSION = "event-v2"
+EVENT_MIN_LOCAL_SUPPORT = 2
+EVENT_MIN_LOCAL_SUPPORT_FRACTION = 0.50
+# Short broadcast edits can contain only a few effects; once the local vote
+# agrees, an eight-second run is sufficient to represent that editorial cut.
+EVENT_MIN_SEGMENT_SECONDS = 8.0
+EVENT_RECOVERY_MIN_STRENGTH = 0.08
+EVENT_RECOVERY_OFFSET_TOLERANCE = 0.75
+EVENT_RECOVERY_MIN_SEPARATION_SECONDS = 8.0
+EVENT_RECOVERY_MAX_LEAD_SECONDS = 60.0
+EVENT_CHROMA_CACHE_VERSION = "event-v3"
 
 
 class Video:
@@ -507,6 +531,45 @@ def _stable_event_shift_points(
     return shift_points
 
 
+def _recover_confirmed_event_boundaries(
+    correspondences: list[tuple[float, float, float, float]],
+    shift_points: list[tuple[float, float, float]],
+) -> list[tuple[float, float, float]]:
+    """Move a confirmed edit boundary to the first usable post-cut event."""
+    if len(shift_points) < 2:
+        return shift_points
+    candidates = sorted(correspondences, key=lambda item: (item[0], item[1]))
+    recovered = list(shift_points)
+    for index in range(1, len(shift_points)):
+        left, right = shift_points[index - 1], shift_points[index]
+        if abs(right[2] - left[2]) <= EVENT_RECOVERY_OFFSET_TOLERANCE:
+            continue
+        window = [
+            item for item in candidates
+            if left[0] < item[0] < right[0]
+            and right[0] - item[0] <= EVENT_RECOVERY_MAX_LEAD_SECONDS
+            and abs(item[2] - right[2]) <= EVENT_RECOVERY_OFFSET_TOLERANCE
+            and item[3] >= EVENT_RECOVERY_MIN_STRENGTH
+        ]
+        if len(window) < 2:
+            continue
+        separated = [window[0]]
+        for item in window[1:]:
+            if item[0] - separated[-1][0] >= EVENT_RECOVERY_MIN_SEPARATION_SECONDS:
+                separated.append(item)
+        if len(separated) < 2:
+            continue
+        first = separated[0]
+        offset = float(np.median([item[2] for item in separated]))
+        recovered[index] = (first[0], first[1], offset)
+        logger.info(
+            "Recovering confirmed cross-language edit boundary at %.3fs "
+            "(offset %.3fs; %d weaker corroborating events)",
+            first[0], offset, len(separated),
+        )
+    return recovered
+
+
 def estimate_audio_shift_points(
     x_1_chroma,
     x_2_chroma,
@@ -614,6 +677,7 @@ def estimate_audio_shift_points(
 
     if event_anchors and source_event_strength is not None and target_event_strength is not None:
         event_correspondences = []
+        all_event_correspondences = []
         seen_target_peaks = set()
         seen_source_peaks = set()
         for diff, (target_time, source_time) in zip(all_diffs, all_timestamps):
@@ -629,16 +693,22 @@ def estimate_audio_shift_points(
             # single gunshot dozens of votes just because it lingers over a few
             # adjacent CQT frames.
             if (
-                strength >= EVENT_MIN_STRENGTH
+                strength >= EVENT_RECOVERY_MIN_STRENGTH
                 and target_index not in seen_target_peaks
                 and source_index not in seen_source_peaks
             ):
-                event_correspondences.append((target_time, source_time, diff, float(strength)))
+                correspondence = (target_time, source_time, diff, float(strength))
+                all_event_correspondences.append(correspondence)
+                if strength >= EVENT_MIN_STRENGTH:
+                    event_correspondences.append(correspondence)
                 seen_target_peaks.add(target_index)
                 seen_source_peaks.add(source_index)
 
         event_points = _stable_event_shift_points(event_correspondences)
         if event_points:
+            event_points = _recover_confirmed_event_boundaries(
+                all_event_correspondences, event_points
+            )
             logger.info(
                 "Using %d corroborated spectral-transient anchor(s) for cross-language alignment",
                 len(event_points),
@@ -907,8 +977,8 @@ def generate_chroma_cqt(
     peak_distance = max(round(EVENT_PEAK_SEPARATION_SECONDS * fs / HOP_LENGTH), 1)
     peak_indexes, _ = find_peaks(
         event_strength,
-        height=0.05,
-        prominence=0.08,
+        height=0.035,
+        prominence=0.05,
         distance=peak_distance,
     )
     isolated_events = np.zeros_like(event_strength)
@@ -1389,6 +1459,41 @@ def extract_and_sync_subtitles(
     return output_file
 
 
+def _source_audio_encode_options(audio_stream):
+    """Build final-render options that retain the source audio format.
+
+    Segmented and speed-adjusted audio is first normalized to FLAC so the
+    concat demuxer never joins packets with incompatible codec configuration.
+    The final pass can then encode that one continuous timeline back to the
+    source codec without accumulating an encoder delay at every edit boundary.
+    """
+
+    source_codec = audio_stream.get('codec_name')
+    if not source_codec or source_codec in {'unknown', 'none'}:
+        return None
+    source_codec = source_codec.casefold()
+    encoder = AUDIO_ENCODER_ALIASES.get(source_codec, source_codec)
+    options = ['-c:a', encoder]
+
+    sample_rate = audio_stream.get('sample_rate')
+    if sample_rate:
+        options += ['-ar:a', str(sample_rate)]
+    channel_layout = audio_stream.get('channel_layout')
+    if channel_layout:
+        options += ['-channel_layout:a', str(channel_layout)]
+    elif audio_stream.get('channels'):
+        options += ['-ac:a', str(audio_stream['channels'])]
+
+    bit_rate = audio_stream.get('bit_rate')
+    if source_codec in BITRATE_CONTROLLED_CODECS and bit_rate:
+        try:
+            if int(bit_rate) > 0:
+                options += ['-b:a', str(bit_rate)]
+        except (TypeError, ValueError):
+            pass
+    return options
+
+
 def extract_and_sync_audio(
     video_file,
     track_id,
@@ -1443,8 +1548,10 @@ def extract_and_sync_audio(
     # are reported as ``aac``, but their AudioSpecificConfig differs. Mixing
     # them corrupts the resulting Matroska track and fails only later when a
     # fallback renderer decodes it. FLAC also avoids cumulative lossy encoder
-    # priming at edit boundaries. A single uninterrupted, copy-safe source
-    # track still keeps its original codec.
+    # priming at edit boundaries. Once the timeline is complete, it is encoded
+    # once to the source format, retaining its codec properties where FFmpeg
+    # supports that encoder. A single uninterrupted, copy-safe source track
+    # still keeps its original packets.
     def needs_lossless_timeline() -> bool:
         if framerate_align or len(sync_buckets) > 1:
             return True
@@ -1470,7 +1577,7 @@ def extract_and_sync_audio(
     )
     if lossless_timeline:
         logger.info(
-            "Normalizing segmented audio to a lossless FLAC timeline before concatenation"
+            "Normalizing segmented audio to a lossless FLAC timeline before final rendering"
         )
     for t1, t2, delta in sync_buckets:
         target_start = t1 + delta
@@ -1614,33 +1721,59 @@ def extract_and_sync_audio(
     input_file.write_text("\n".join(_ffconcat_file_line(path) for path in audio_file_list))
     actual_audio_output_file = audio_output_file.with_suffix(f".mkv")
     logger.info(f"Combining audio segments for {str(actual_audio_output_file)}")
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(input_file),
-        "-c:a",
-        'copy' if lossless_timeline else (
-            "flac" if audio_stream["codec_name"] in LOSSLESS_CODECS else 'copy'
-        ),
-        "-fflags", "+bitexact",
-        '-strict', 'experimental',
-        str(actual_audio_output_file),
-    ]
-    combined = subprocess.run(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
+    source_encode_options = (
+        _source_audio_encode_options(audio_stream) if lossless_timeline else None
     )
+
+    def combine_audio(codec_options):
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(input_file),
+            *codec_options,
+            "-fflags", "+bitexact",
+            '-strict', 'experimental',
+            str(actual_audio_output_file),
+        ]
+        return subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+    if source_encode_options and audio_stream['codec_name'].casefold() != 'flac':
+        logger.info(
+            "Rendering synchronized FLAC timeline as source %s audio",
+            audio_stream['codec_name'],
+        )
+        combined = combine_audio(source_encode_options)
+        if combined.returncode:
+            detail = combined.stderr.strip() or "no diagnostic output"
+            logger.warning(
+                "FFmpeg cannot render synchronized audio as source %s; retaining FLAC "
+                "instead: %s",
+                audio_stream['codec_name'],
+                detail[-1000:],
+            )
+            combined = combine_audio(['-c:a', 'copy'])
+    else:
+        combined = combine_audio(
+            ['-c:a', 'copy'] if lossless_timeline else (
+                ["-c:a", "flac"]
+                if audio_stream["codec_name"] in LOSSLESS_CODECS
+                else ['-c:a', 'copy']
+            )
+        )
     if combined.returncode:
         detail = combined.stderr.strip() or "no diagnostic output"
         raise RuntimeError(

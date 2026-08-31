@@ -10,9 +10,25 @@ from .defaults import SIDECAR_SUBTITLE_EXTENSIONS
 from .errors import ConfigurationError
 from .languages import normalize_language
 from .models import PairCandidate, SidecarSubtitle, SidecarSubtitleCandidate
-from .naming import natural_sort_key
+from .naming import natural_sort_key, parse_identity
 
 _LANGUAGE_TAG_RE = re.compile(r"^(?:[A-Za-z]{2,3}|und)(?:[-_][A-Za-z0-9]{2,8})*$")
+_PORTUGUESE_SIDECAR_RE = re.compile(
+    r"(?:^|[. _-])(?:pt(?:[-_][a-z]{2})?|pob|por(?:tuguese)?)(?:$|[. _-])",
+    re.IGNORECASE,
+)
+
+
+def _sidecar_source(source: str, path: Path) -> str:
+    """Treat an explicitly Portuguese sidecar as a DUAL-side subtitle.
+
+    Users commonly name a translated sidecar after the master release, e.g.
+    ``master.pt-BR.srt``.  Its filename prefix must not make it inherit the
+    master's timeline.
+    """
+    if source == "master" and _PORTUGUESE_SIDECAR_RE.search(path.stem):
+        return "dual"
+    return source
 
 
 def discover_pair_sidecars(candidate: PairCandidate) -> list[SidecarSubtitleCandidate]:
@@ -39,8 +55,41 @@ def discover_pair_sidecars(candidate: PairCandidate) -> list[SidecarSubtitleCand
             if sidecar_stem == stem or sidecar_stem.startswith(f"{stem}."):
                 found.setdefault(
                     sibling.resolve(),
-                    SidecarSubtitleCandidate(sibling.resolve(), source),  # type: ignore[arg-type]
+                    SidecarSubtitleCandidate(
+                        sibling.resolve(),
+                        _sidecar_source(source, sibling),  # type: ignore[arg-type]
+                    ),
                 )
+    # When a subtitle is not named after the release, accept exactly one
+    # text subtitle whose parsed identity is the selected pair's identity.
+    # This keeps a directory containing subtitles for neighboring episodes
+    # safe: their SxxExx key will not match this candidate.
+    if not found:
+        pair_key = candidate.identity.key
+        directories = {candidate.dual.path.parent, candidate.normal.path.parent}
+        fallback: list[Path] = []
+        unlabelled: list[Path] = []
+        for directory in directories:
+            try:
+                siblings = directory.iterdir()
+            except OSError as exc:
+                raise ConfigurationError(
+                    f"Cannot inspect sidecars next to {directory}: {exc}"
+                ) from exc
+            for sibling in siblings:
+                if sibling.is_file() and sibling.suffix.casefold() in {".srt", ".ass"}:
+                    identity = parse_identity(sibling)
+                    if identity.key == pair_key:
+                        fallback.append(sibling.resolve())
+                    elif identity.kind == "unknown":
+                        unlabelled.append(sibling.resolve())
+        fallback = list(dict.fromkeys(fallback))
+        if not fallback and len(set(unlabelled)) == 1:
+            fallback = [unlabelled[0]]
+        if len(fallback) == 1:
+            path = fallback[0]
+            found[path] = SidecarSubtitleCandidate(path, "dual")
+
     source_order = {"dual": 0, "master": 1}
     return sorted(
         found.values(),

@@ -407,9 +407,10 @@ def create_job_plan(
         dub_selections=dubs,
         output_original=output_original,
         fps=fps,
-        # TVRip's segment validator compares a common original track.  A
-        # Portuguese-only source instead uses the separate event-anchor path,
-        # so it cannot safely enter that dialogue-dependent validator.
+        # TVRip's full segment validator compares a common original track. A
+        # Portuguese-only source uses the separate event-anchor path instead;
+        # it remains a regular DUAL job, while its mapped master-only gaps can
+        # still use the universal original-audio fallback.
         source_kind=(
             candidate.source_kind
             if candidate.alignment_mode == "common-original"
