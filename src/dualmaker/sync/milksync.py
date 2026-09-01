@@ -1698,12 +1698,18 @@ def extract_and_sync_audio(
         if framerate_align:
             cmd += [
                 "-filter:a",
-                f"atempo={speed_factor:.12f}",
+                f"asetpts=PTS-STARTPTS,atempo={speed_factor:.12f}",
                 "-sample_fmt",
                 "s16",
             ]
         elif lossless_timeline:
-            cmd += ["-sample_fmt", "s16"]
+            # Input-side seeking preserves a positive stream PTS when the
+            # source audio track carries a container delay.  Each extracted
+            # piece is concatenated as a zero-based segment, so retaining that
+            # PTS adds a spurious delay to the opening (and can shift every
+            # later edit boundary).  The map is the timeline authority; reset
+            # the decoded piece before writing the lossless intermediate.
+            cmd += ["-filter:a", "asetpts=PTS-STARTPTS", "-sample_fmt", "s16"]
         else:
             cmd += ["-ss", str(t1), "-t", str(t2 - t1)]
         cmd.append(str(segment_output_file))

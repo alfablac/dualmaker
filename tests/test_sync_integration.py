@@ -102,6 +102,42 @@ class SyncBucketUnitTests(unittest.TestCase):
 
 @unittest.skipUnless(all(shutil.which(tool) for tool in TOOLS), "media tools are required")
 class SyncIntegrationTests(unittest.TestCase):
+    def test_segmented_audio_resets_positive_source_pts_per_piece(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mkv"
+            subprocess.run(
+                (
+                    "ffmpeg", "-v", "error", "-y",
+                    "-f", "lavfi", "-i", "color=size=32x32:rate=24:duration=4",
+                    "-itsoffset", "0.75", "-f", "lavfi", "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=4",
+                    "-map", "0:v", "-map", "1:a",
+                    "-c:v", "libx264", "-c:a", "ac3", source,
+                ),
+                check=True,
+            )
+            output = extract_and_sync_audio(
+                Video(source),
+                0,
+                4.0,
+                [(0.0, 0.0, 0.0), (2.0, 2.0, 0.0)],
+                [(0.0, 2.0, 0.0), (2.0, 1_000_000.0, 0.0)],
+                [],
+                root / "positive-start-pts.unknown",
+            )
+            probe = subprocess.run(
+                (
+                    "ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "packet=pts_time", "-read_intervals", "%+#1",
+                    "-of", "csv=p=0", output,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertLess(abs(float(probe.stdout.split(",", 1)[0])), 0.05)
+
     def test_negative_delta_removes_audio_instead_of_only_logging_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
