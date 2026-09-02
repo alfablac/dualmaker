@@ -1434,6 +1434,10 @@ def main(
                         progress_display.update(task, description="Cancelled safely")
                         break
                     results.append(result)
+                    if not config.dry_run:
+                        result.validation["archival"] = archive_processed_inputs(
+                            [result], Path(config.path).expanduser().resolve()
+                        )
                     progress_display.advance(task)
                     ui.result(result)
     except UserCancelledError as exc:
@@ -1441,11 +1445,6 @@ def main(
     except DualMakerError as exc:
         _exit_error(config, str(exc), code=1)
 
-    if not config.dry_run:
-        for result in results:
-            result.validation["archival"] = archive_processed_inputs(
-                [result], Path(config.path).expanduser().resolve()
-            )
     report_path = config.report or default_report_path(Path(report_root).expanduser().resolve())
     report_payload = {
         "summary": build_report_summary(results, skipped, cancelled_message),
