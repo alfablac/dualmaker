@@ -188,6 +188,7 @@ DEFAULT_MIN_MKVMERGE_VERSION = 76
 
 DEFAULT_IGNORED_DIR_NAMES = (
     DEFAULT_OUTPUT_DIR_NAME,
+    "processed",
     DEFAULT_WORK_DIR_NAME,
     ".git",
     ".venv",

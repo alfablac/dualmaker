@@ -67,7 +67,7 @@ from .errors import (
 from .metadata import MediaInspector
 from .models import DualMakerConfig, JobResult, jsonable
 from .pipeline import plan_batch, plan_explicit, process_job
-from .reporting import default_report_path, write_report
+from .reporting import archive_processed_inputs, build_report_summary, default_report_path, write_report
 from .runner import ToolRunner, check_dependencies
 from .ui import TerminalUI
 
@@ -1441,8 +1441,14 @@ def main(
     except DualMakerError as exc:
         _exit_error(config, str(exc), code=1)
 
+    if not config.dry_run:
+        for result in results:
+            result.validation["archival"] = archive_processed_inputs(
+                [result], Path(config.path).expanduser().resolve()
+            )
     report_path = config.report or default_report_path(Path(report_root).expanduser().resolve())
     report_payload = {
+        "summary": build_report_summary(results, skipped, cancelled_message),
         "version": __version__,
         "config": jsonable(config),
         "dependencies": dependency_status,

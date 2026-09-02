@@ -878,7 +878,7 @@ def analyze_fps_timing(
         # is otherwise inconclusive. Choosing the container ratio merely from
         # a weak visual score can stretch same-tempo DVD audio and corrupt
         # every subsequent edit boundary.
-        if telecine_candidate and not duration_candidates and selected_label == "fps_ratio":
+        if telecine_candidate and selected_label == "fps_ratio":
             real_time_hypothesis = discovery.get("real_time") or local.get("real_time")
             if real_time_hypothesis is not None:
                 selected_label = "real_time"
