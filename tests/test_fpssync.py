@@ -272,6 +272,63 @@ class FPSDecisionTests(unittest.TestCase):
         )
         self.assertFalse(result.apply_speed_correction)
 
+    def test_telecine_editorial_duration_does_not_prove_pal_speed(self) -> None:
+        """A 1000:1001 audio-duration candidate must not enable 0.8x audio retiming."""
+        config = DualMakerConfig(allow_experimental_fps_sync=True)
+        decision = evaluate_fps_pair(
+            asset("master.mkv", 1000, FrameRate(24000, 1001)),
+            asset("dual.mkv", 966.32, FrameRate(30000, 1001)),
+            config,
+        )
+        weak_samples = [FPSMatchSample(0.5, 500, 500, 0.3)]
+
+        def weak_hypothesis(
+            *_args: object, speed_factor: float, **_kwargs: object
+        ) -> _Hypothesis:
+            return _Hypothesis(
+                speed_factor=speed_factor,
+                # Make the duration-nominated PAL candidate look stronger,
+                # as in the Walker report, without reliable content matches.
+                confidence=0.6 if abs(speed_factor - 0.96) < 0.001 else 0.3,
+                samples=weak_samples,
+            )
+
+        with (
+            patch(
+                "dualmaker.fpssync._analyze_hypothesis",
+                side_effect=weak_hypothesis,
+            ),
+            patch(
+                "dualmaker.fpssync._extract_anchor_descriptors",
+                return_value=(
+                    np.ones((3, 2), dtype=np.float32),
+                    np.ones(3, dtype=np.float32),
+                ),
+            ),
+            patch(
+                "dualmaker.fpssync._adaptive_anchor_hypothesis",
+                side_effect=weak_hypothesis,
+            ),
+        ):
+            result = analyze_fps_timing(
+                Path("dual.mkv"),
+                Path("master.mkv"),
+                duration=966.32,
+                source_duration=966.32,
+                decision=decision,
+                config=config,
+                work_dir=Path("."),
+                runner=object(),  # type: ignore[arg-type]
+                source_original_duration=966.32,
+                target_original_duration=1000,
+            )
+
+        self.assertEqual(
+            result.validation["best_effort_fps_fallback"]["selected_hypothesis"],  # type: ignore[index]
+            "real_time",
+        )
+        self.assertFalse(result.apply_speed_correction)
+
     def test_telecine_acoustic_fallback_defers_final_video_proof_to_tvrip_segments(self) -> None:
         decision = evaluate_fps_pair(
             asset("master.mkv", 1000, FrameRate(24000, 1001)),

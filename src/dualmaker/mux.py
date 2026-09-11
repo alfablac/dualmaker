@@ -651,6 +651,31 @@ def mux_output(
         else dual.duration
     )
     for track in sync.binary_subtitles:
+        # Bitmap subtitle streams from the DUAL source are only useful here
+        # when they are the configured dub language.  Other languages are
+        # normally already supplied by the WEB/master release, and retaining
+        # their VobSub/PGS packets can make an otherwise valid edit-aware map
+        # fail because bitmap timestamps cannot represent multiple delays.
+        if (
+            config.subtitle_policy == "prefer-master"
+            and base_language(normalize_language(track.effective_language))
+            != base_language(normalize_language(config.dub_language))
+        ):
+            LOGGER.warning(
+                "Omitting non-dub DUAL bitmap subtitle track %s (%s): "
+                "master-preferred bitmap policy",
+                track.id,
+                track.effective_language,
+            )
+            bitmap_timing.append(
+                {
+                    "track_id": track.id,
+                    "codec": track.codec_id or track.codec,
+                    "status": "omitted-non-dub-bitmap",
+                    "reason": "master-preferred bitmap policy",
+                }
+            )
+            continue
         if track.codec_id.casefold() == "s_hdmv/pgs":
             destination = work_dir / f"bitmap-{track.id}-synchronized.sup"
             try:

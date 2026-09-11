@@ -203,9 +203,11 @@ class TelecineLinearDriftRunner(FakeRunner):
         # The first pass exposes the source clock. Once atempo is requested,
         # Milksync measures the already-rendered waveform and reports a unit
         # residual.
-        reported_factor = (
-            1.0 if "--framerate-speed-factor" in self.command else self.factor
+        applied = (
+            float(self.command[self.command.index("--framerate-speed-factor") + 1])
+            if "--framerate-speed-factor" in self.command else 1.0
         )
+        reported_factor = self.factor / applied
         points = [
             [source / reported_factor, source, source / reported_factor - source]
             for source in range(0, 1201, 20)
@@ -572,6 +574,61 @@ class AdapterMappingTests(unittest.TestCase):
                 runner.commands[1].index("--framerate-speed-factor") + 1
             ]
             self.assertAlmostEqual(float(rendered_factor), factor, places=9)
+            self.assertAlmostEqual(result.speed_correction_factor, factor, places=9)
+            post = plan.fps.validation["spectral_post_sync_validation"]
+            self.assertAlmostEqual(float(post["relative_speed_factor"]), 1.0)  # type: ignore[index]
+            history = plan.fps.validation["spectral_speed_refinements"]
+            self.assertEqual(history[0]["correction_method"], "post-map-linear-drift-rescue")  # type: ignore[index]
+
+    def test_completed_map_undoes_unproven_pal_slowdown(self) -> None:
+        """A dense final map must not be rendered as hundreds of silence gaps."""
+
+        project_temp = Path.cwd() / ".test-work"
+        project_temp.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=project_temp) as directory:
+            root = Path(directory)
+            master_original = Track(1, "audio", 0, language_ietf="en")
+            dual_original = Track(2, "audio", 0, language_ietf="en")
+            master = MediaAsset(root / "master.mkv", 1446, [master_original])
+            dual = MediaAsset(root / "dual.mkv", 1414, [dual_original])
+            factor = 1.0
+            plan = JobPlan(
+                normal=master,
+                dual=dual,
+                identity=ContentIdentity("episode", "show", season=1, episodes=(1,)),
+                output=root / "output.mkv",
+                normal_original=master_original,
+                dual_original=dual_original,
+                dub_tracks=[],
+                normal_subtitles=[],
+                dual_subtitles=[],
+                source_kind="tvrip",
+                fps=FPSDecision(
+                    required=True,
+                    approved=True,
+                    proposed_speed_factor=0.96,
+                    apply_speed_correction=True,
+                    validation={"best_effort_fps_fallback": {"enabled": True}},
+                ),
+            )
+            runner = TelecineLinearDriftRunner(factor)
+            with (
+                patch.object(MilksyncAdapter, "_refine_experimental_speed"),
+                patch("dualmaker.sync.adapter.first_packet_pts", return_value=0.0),
+            ):
+                result = MilksyncAdapter(runner).synchronize(  # type: ignore[arg-type]
+                    plan,
+                    normal_path=master.path,
+                    dual_path=dual.path,
+                    temp_dir=root / "work",
+                    config=DualMakerConfig(),
+                )
+
+            self.assertEqual(len(runner.commands), 2)
+            self.assertIn("--framerate-speed-factor", runner.commands[0])
+            self.assertNotIn("--framerate-speed-factor", runner.commands[1])
+            self.assertNotIn("--align-framerate", runner.commands[1])
+            self.assertFalse(plan.fps.apply_speed_correction)
             self.assertAlmostEqual(result.speed_correction_factor, factor, places=9)
             post = plan.fps.validation["spectral_post_sync_validation"]
             self.assertAlmostEqual(float(post["relative_speed_factor"]), 1.0)  # type: ignore[index]

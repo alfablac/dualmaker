@@ -600,6 +600,12 @@ class MilksyncAdapter:
         while True:
             temp_option = command.index("--temp-folder")
             command[temp_option + 1] = temp_dir / f"milksync-render-{render_pass}"
+            if not plan.fps.apply_speed_correction:
+                if "--framerate-speed-factor" in command:
+                    factor_option = command.index("--framerate-speed-factor")
+                    del command[factor_option : factor_option + 2]
+                if "--align-framerate" in command:
+                    command.remove("--align-framerate")
             if "--framerate-speed-factor" in command:
                 factor_option = command.index("--framerate-speed-factor")
                 command[factor_option + 1] = f"{plan.fps.proposed_speed_factor:.12f}"
@@ -830,16 +836,27 @@ class MilksyncAdapter:
             # a linear clock difference.  Rendering that map piece by piece
             # without correcting its clock turns every gradual delay change
             # into a short silence gap.  Correct the clock once, then rerun
-            # Milksync and validate the corrected map normally.
+            # Milksync and validate the corrected map normally. The same rescue
+            # applies to an unproven FPS fallback, including a slowdown inferred
+            # from an editorial duration difference. Require a majority cluster
+            # before replacing that hypothesis, and never retry indefinitely.
             if (
-                acoustic_tvrip_fallback
+                (
+                    acoustic_tvrip_fallback
+                    or plan.fps.validation.get("best_effort_fps_fallback", {}).get("enabled")
+                )
                 and render_pass == 0
-                and not plan.fps.apply_speed_correction
+                and float(residual.get("inlier_fraction", 0.0)) >= 0.5
                 and relative_speed_factor is not None
                 and abs(relative_speed_factor - 1.0)
                 > max(config.fps_speed_ratio_tolerance, 0.003)
             ):
-                measured_factor = float(observed_speed_factor)
+                # The map uses the already tempo-adjusted source clock.
+                # Compose its residual with that tempo, including undoing an
+                # unsupported slowdown when the measured source is real time.
+                measured_factor = applied_speed_factor * relative_speed_factor
+                if abs(measured_factor - 1.0) <= 0.000_001:
+                    measured_factor = 1.0
                 maximum_adjustment = min(
                     config.fps_spectral_max_speed_adjustment,
                     config.tvrip_max_speed_adjustment,
@@ -848,7 +865,7 @@ class MilksyncAdapter:
                     refinement_history.append(
                         {
                             "render_pass": render_pass,
-                            "previous_speed_factor": 1.0,
+                            "previous_speed_factor": applied_speed_factor,
                             "residual_speed_factor": relative_speed_factor,
                             "projected_drift_seconds": float(projected_drift or 0.0),
                             "refined_speed_factor": measured_factor,
@@ -857,16 +874,16 @@ class MilksyncAdapter:
                     )
                     plan.fps.proposed_speed_factor = measured_factor
                     plan.fps.detected_speed_factor = measured_factor
-                    plan.fps.apply_speed_correction = True
+                    plan.fps.apply_speed_correction = measured_factor != 1.0
                     residual["linear_drift_rescue"] = True
                     plan.fps.reason = (
                         "The completed common-original map measured a stable linear "
-                        "TVRip program clock; rendering once more with that clock "
+                        "program clock; rendering once more with that clock "
                         "prevents gradual delay changes from becoming silent joins"
                     )
                     render_pass += 1
                     LOGGER.warning(
-                        "Completed TVRip map proved a stable linear clock %.9f; "
+                        "Completed audio map proved a stable linear clock %.9f; "
                         "rerendering with time correction instead of inserting %.3fs "
                         "of gradual timeline gaps",
                         measured_factor,
@@ -1036,8 +1053,13 @@ class MilksyncAdapter:
         output_sidecars: list[SidecarSubtitle] = []
         for index, sidecar in enumerate(plan.sidecar_subtitles):
             source_subtitle = sidecar.path
-            if sidecar.source == "dual" and plan.dual_subtitles and any(
-                not is_text_subtitle(track) for track in plan.dual_subtitles
+            if (
+                sidecar.source == "dual"
+                and sidecar.align_with_reference
+                and plan.dual_subtitles
+                and any(
+                    not is_text_subtitle(track) for track in plan.dual_subtitles
+                )
             ):
                 # Bitmap subtitles cannot be used as the output of an
                 # edit-aware map. If an external text replacement exists,

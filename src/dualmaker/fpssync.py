@@ -873,12 +873,11 @@ def analyze_fps_timing(
             selected = _Hypothesis(speed_factor=container_speed_factor)
             selected_strategy = "best-effort-container"
         # A 29.97/23.976 cadence mismatch is not evidence of a 20% audio
-        # tempo change. If the common-original durations do not nominate a
-        # standard content clock, prefer real time when a telecine candidate
-        # is otherwise inconclusive. Choosing the container ratio merely from
-        # a weak visual score can stretch same-tempo DVD audio and corrupt
-        # every subsequent edit boundary.
-        if telecine_candidate and selected_label == "fps_ratio":
+        # tempo change. Duration differences can also come from editorial
+        # cuts, even when their ratio happens to resemble PAL speedup. Without
+        # reliable content anchors, start every telecine candidate in real
+        # time and let the common-original acoustic map measure its clock.
+        if telecine_candidate:
             real_time_hypothesis = discovery.get("real_time") or local.get("real_time")
             if real_time_hypothesis is not None:
                 selected_label = "real_time"

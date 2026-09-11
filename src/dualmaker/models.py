@@ -204,6 +204,11 @@ class SidecarSubtitle:
     path: Path
     source: AudioSource
     language: str
+    # OCR generated from an embedded subtitle already has the source
+    # subtitle's clock.  Running ALASS against another subtitle can apply a
+    # second cut/offset adjustment, so these files go straight through the
+    # validated Milksync map.
+    align_with_reference: bool = True
 
 
 @dataclass(slots=True)

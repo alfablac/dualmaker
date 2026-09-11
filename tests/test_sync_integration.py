@@ -6,11 +6,15 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
 
 from dualmaker.sync.milksync import (
     Video,
     _recover_confirmed_event_boundaries,
     _stable_event_shift_points,
+    estimate_audio_shift_points,
     extract_and_sync_audio,
     turn_audio_shift_points_to_audio_segments,
 )
@@ -19,6 +23,22 @@ TOOLS = ("ffmpeg", "ffprobe", "mediainfo")
 
 
 class SyncBucketUnitTests(unittest.TestCase):
+    def test_guided_windows_follow_edits_larger_than_the_matrix_window(self) -> None:
+        rng = np.random.default_rng(41)
+        master = rng.uniform(0.01, 1.0, (1800, 12))
+        source = np.concatenate([master[:400], master[530:1000], master[1140:]])
+        with patch("dualmaker.sync.milksync.HOP_LENGTH", 1024):
+            points = estimate_audio_shift_points(
+                source, master, 1024,
+                max_cost_matrix_size=40_000, sliding_window_size=30,
+            )
+        # The cumulative 270-second edit exceeds the 200-frame detailed
+        # window. A fixed diagonal search cannot find this final section.
+        final = points[-1]
+        self.assertAlmostEqual(final[2], 270.0)
+        self.assertAlmostEqual(final[0], 1140.0, delta=2.0)
+        self.assertAlmostEqual(final[1], 870.0, delta=2.0)
+
     def test_cross_language_events_need_local_transient_agreement(self) -> None:
         """A repeated cue cannot become a long false synchronization bucket."""
 

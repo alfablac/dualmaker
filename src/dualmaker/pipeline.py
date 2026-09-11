@@ -321,48 +321,52 @@ def process_job(
             target_language = base_language(
                 normalize_language(config.sidecar_dual_language or config.dub_language)
             )
-            ocr_track = next(
-                (
-                    track
-                    for track in bitmap_tracks
-                    if base_language(normalize_language(track.effective_language))
-                    == target_language
-                    and track.codec_id.casefold() == "s_vobsub"
-                ),
-                None,
-            )
-            if ocr_track is not None:
+            ocr_tracks = [
+                track
+                for track in bitmap_tracks
+                if base_language(normalize_language(track.effective_language))
+                == target_language
+                and track.codec_id.casefold() == "s_vobsub"
+            ]
+            if ocr_tracks:
                 notify("Checking for local OCR replacement of VobSub subtitles")
-                ocr_path = work_dir / f"ocr-track-{ocr_track.id}.srt"
-                try:
-                    ocr_vobsub(
-                        dual_path,
-                        ocr_track,
-                        ocr_path,
-                        work_dir=work_dir,
-                        runner=runner,
+                plan.sidecar_subtitles = [
+                    item
+                    for item in plan.sidecar_subtitles
+                    if not (
+                        item.source == "dual"
+                        and base_language(normalize_language(item.language))
+                        == target_language
                     )
-                except Exception as exc:
-                    if not any(item.source == "dual" for item in plan.sidecar_subtitles):
-                        raise
-                    LOGGER.warning(
-                        "VobSub OCR was unavailable or failed; retaining the supplied "
-                        "DUAL sidecar: %s",
-                        exc,
-                    )
-                else:
-                    plan.sidecar_subtitles = [
-                        item
-                        for item in plan.sidecar_subtitles
-                        if not (
-                            item.source == "dual"
-                            and base_language(normalize_language(item.language))
-                            == target_language
+                ]
+                for ocr_track in ocr_tracks:
+                    ocr_path = work_dir / f"ocr-track-{ocr_track.id}.srt"
+                    try:
+                        ocr_vobsub(
+                            dual_path,
+                            ocr_track,
+                            ocr_path,
+                            work_dir=work_dir,
+                            runner=runner,
                         )
-                    ]
-                    plan.sidecar_subtitles.append(
-                        SidecarSubtitle(ocr_path, "dual", normalize_language(ocr_track.effective_language))
-                    )
+                    except Exception as exc:
+                        if not any(item.source == "dual" for item in plan.sidecar_subtitles):
+                            raise
+                        LOGGER.warning(
+                            "VobSub OCR was unavailable or failed for track %s; retaining "
+                            "the supplied DUAL sidecar: %s",
+                            ocr_track.id,
+                            exc,
+                        )
+                    else:
+                        plan.sidecar_subtitles.append(
+                            SidecarSubtitle(
+                                ocr_path,
+                                "dual",
+                                normalize_language(ocr_track.effective_language),
+                                align_with_reference=False,
+                            )
+                        )
         recap_report: dict[str, object] = {"enabled": config.trim_recap, "applied": False}
         if (
             config.trim_recap

@@ -597,38 +597,56 @@ def estimate_audio_shift_points(
         chroma_slice_size = 100_000_000
         chroma_slice_step = 100_000_000
 
+    # Guide bounded high-resolution windows with a whole-program path. Fixed
+    # diagonal windows lose the matching scene once editorial offsets exceed
+    # their overlap, even though both recordings have the same audio clock.
+    guide = None
+    if expected_matrix_size > max_cost_matrix_size:
+        stride = max(2, math.ceil(math.sqrt(expected_matrix_size / max_cost_matrix_size)))
+        while (
+            math.ceil(len(x_1_chroma) / stride) * math.ceil(len(x_2_chroma) / stride)
+            > max_cost_matrix_size
+        ):
+            stride += 1
+
+        def coarse(chroma):
+            return np.asarray([
+                np.mean(chroma[start:start + stride], axis=0)
+                for start in range(0, len(chroma), stride)
+            ])
+        coarse_cost = np.nan_to_num(
+            cdist(coarse(x_2_chroma), coarse(x_1_chroma), metric="cosine")
+        )
+        coarse_accumulated, coarse_path = librosa.sequence.dtw(C=coarse_cost)
+        guide = np.flip(coarse_path, axis=0) * stride
+        del coarse_cost, coarse_accumulated, coarse_path
+
     all_diffs = None
     all_timestamps = None
 
-    for i in range(
-        0, max([len(x_1_chroma), len(x_2_chroma)]), chroma_slice_step
-    ):  # TODO
-        start_i = max(
-            min(
-                len(x_1_chroma) - chroma_slice_step,
-                len(x_2_chroma) - chroma_slice_step,
-                i,
-            ),
-            0,
-        )
-
-        x_1_chroma_slice = x_1_chroma[start_i : start_i + chroma_slice_size]
-        x_2_chroma_slice = x_2_chroma[start_i : start_i + chroma_slice_size]
-        if start_i:
-            wp_offset = librosa.frames_to_time([start_i], sr=fs, hop_length=HOP_LENGTH)[
-                0
-            ]
-        else:
-            wp_offset = 0
+    for target_start in range(0, len(x_2_chroma), chroma_slice_step):
+        source_start = target_start
+        if guide is not None:
+            center = min(target_start + chroma_slice_size // 2, len(x_2_chroma) - 1)
+            nearest = np.argmin(np.abs(guide[:, 0] - center))
+            source_start = int(guide[nearest, 1] - (center - target_start))
+            window_size = min(chroma_slice_size, len(x_2_chroma) - target_start)
+            source_start = max(0, min(source_start, len(x_1_chroma) - window_size))
+        x_1_chroma_slice = x_1_chroma[source_start : source_start + chroma_slice_size]
+        x_2_chroma_slice = x_2_chroma[target_start : target_start + chroma_slice_size]
         logger.info(
-            f"Doing chroma slices x1={len(x_1_chroma_slice)} x2={len(x_2_chroma_slice)} {wp_offset=}"
+            "Doing guided chroma slices source=%d target=%d x1=%d x2=%d",
+            source_start, target_start, len(x_1_chroma_slice), len(x_2_chroma_slice),
         )
 
         C = cdist(x_2_chroma_slice, x_1_chroma_slice, metric="cosine")
         C = np.nan_to_num(C, copy=False)
         D, wp = librosa.sequence.dtw(C=C)
+        del C, D
         wp_s = np.flip(
-            librosa.frames_to_time(wp, sr=fs, hop_length=HOP_LENGTH) + wp_offset, axis=0
+            librosa.frames_to_time(
+                wp + np.array([target_start, source_start]), sr=fs, hop_length=HOP_LENGTH
+            ), axis=0
         )
 
         diffs = []

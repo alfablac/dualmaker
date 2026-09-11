@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .errors import DependencyError, ProcessingError
 from .languages import normalize_language
 from .models import Track
 from .runner import ToolRunner
+
+_PORTUGUESE_OCR_REPLACEMENTS = (
+    (re.compile(r"(?<!\w)S6(?!\w)", re.IGNORECASE), "Só"),
+    (re.compile(r"(?<!\w)agiientariam(?!\w)", re.IGNORECASE), "aguentariam"),
+)
+
+
+def correct_portuguese_ocr(text: str) -> str:
+    """Apply conservative, whole-word corrections to Portuguese OCR output."""
+    for pattern, replacement in _PORTUGUESE_OCR_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def ocr_vobsub(
@@ -41,6 +54,10 @@ def ocr_vobsub(
     runner.run((executable, "--lang", language, str(basename)))
     if not srt_path.is_file():
         raise ProcessingError(f"vobsub2srt did not create an SRT for track {track.id}")
+    srt_path.write_text(
+        correct_portuguese_ocr(srt_path.read_text(encoding="utf-8-sig")),
+        encoding="utf-8",
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     srt_path.replace(destination)
     return destination
