@@ -1512,6 +1512,33 @@ def _source_audio_encode_options(audio_stream):
     return options
 
 
+def _minimal_source_audio_encode_options(audio_stream):
+    """Build a conservative retry command for the final source-codec pass.
+
+    Some FFmpeg builds reject the fully described stream options (most often
+    a copied channel-layout name) even though they can encode the codec.  The
+    retry retains the source codec, sample rate, channel count, and bitrate,
+    while avoiding optional layout metadata.
+    """
+    source_codec = str(audio_stream.get("codec_name") or "").casefold()
+    if not source_codec or source_codec in {"unknown", "none"}:
+        return None
+    encoder = AUDIO_ENCODER_ALIASES.get(source_codec, source_codec)
+    options = ["-c:a", encoder]
+    if audio_stream.get("sample_rate"):
+        options += ["-ar:a", str(audio_stream["sample_rate"])]
+    if audio_stream.get("channels"):
+        options += ["-ac:a", str(audio_stream["channels"])]
+    if source_codec in BITRATE_CONTROLLED_CODECS and audio_stream.get("bit_rate"):
+        try:
+            bitrate = int(audio_stream["bit_rate"])
+        except (TypeError, ValueError):
+            bitrate = 0
+        if bitrate > 0:
+            options += ["-b:a", f"{bitrate // 1000}k"]
+    return options
+
+
 def extract_and_sync_audio(
     video_file,
     track_id,
@@ -1784,12 +1811,13 @@ def extract_and_sync_audio(
         if combined.returncode:
             detail = combined.stderr.strip() or "no diagnostic output"
             logger.warning(
-                "FFmpeg cannot render synchronized audio as source %s; retaining FLAC "
-                "instead: %s",
+                "FFmpeg cannot render synchronized audio as source %s; retrying with "
+                "minimal encoder options: %s",
                 audio_stream['codec_name'],
                 detail[-1000:],
             )
-            combined = combine_audio(['-c:a', 'copy'])
+            retry_options = _minimal_source_audio_encode_options(audio_stream)
+            combined = combine_audio(retry_options or source_encode_options)
     else:
         combined = combine_audio(
             ['-c:a', 'copy'] if lossless_timeline else (

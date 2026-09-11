@@ -45,7 +45,7 @@ class ReportingTests(unittest.TestCase):
             )
             write_report(
                 report,
-                {"summary": build_report_summary([result], [], None), "version": "0.9.5"},
+                {"summary": build_report_summary([result], [], None), "version": "0.9.6"},
             )
             raw = report.read_text(encoding="utf-8")
             self.assertTrue(raw.lstrip().startswith('{\n  "summary"'))
