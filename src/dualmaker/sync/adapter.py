@@ -10,6 +10,7 @@ from pathlib import Path
 
 from ..defaults import SIDECAR_LEGACY_TEXT_ENCODINGS, SIDECAR_TEXT_OUTPUT_ENCODING
 from ..errors import ProcessingError
+from ..languages import base_language, normalize_language
 from ..metadata import first_packet_pts
 from ..models import DualMakerConfig, JobPlan, SidecarSubtitle, Track
 from ..runner import ToolRunner
@@ -1173,6 +1174,23 @@ class MilksyncAdapter:
                 )
             )
         sync.sidecar_subtitles = output_sidecars
+        # Once a DUAL bitmap has been converted to text, do not leave the
+        # original bitmap in the synchronization result.  Relying only on
+        # the later mux-time language/slot check allowed a VobSub to survive
+        # in edge cases where OCR produced a different forced/accessibility
+        # presentation slot.
+        replacement_languages = {
+            base_language(normalize_language(item.language))
+            for item in output_sidecars
+            if item.source == "dual"
+        }
+        if replacement_languages:
+            sync.binary_subtitles = [
+                track
+                for track in sync.binary_subtitles
+                if base_language(normalize_language(track.effective_language))
+                not in replacement_languages
+            ]
 
     @staticmethod
     def _convert_sidecar_to_utf8_bom(path: Path, *, destination: Path) -> Path:
