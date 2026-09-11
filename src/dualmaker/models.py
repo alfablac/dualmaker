@@ -209,6 +209,7 @@ class SidecarSubtitle:
     # second cut/offset adjustment, so these files go straight through the
     # validated Milksync map.
     align_with_reference: bool = True
+    forced: bool = False
 
 
 @dataclass(slots=True)
@@ -376,6 +377,7 @@ class DualMakerConfig:
     audio_codec_preference: tuple[str, ...] = DEFAULT_AUDIO_CODEC_PREFERENCE
     audio_selection_margin: float = DEFAULT_AUDIO_SELECTION_MARGIN
     subtitle_policy: SubtitlePolicy = DEFAULT_SUBTITLE_POLICY  # type: ignore[assignment]
+    forced_dual_subtitle: str | None = None
     sidecar_language_overrides: tuple[str, ...] = ()
     sidecar_dual_language: str = DEFAULT_DUAL_SIDECAR_LANGUAGE
     trim_recap: bool = True

@@ -1122,7 +1122,13 @@ class MilksyncAdapter:
             )
             if sidecar.source == "master":
                 output_sidecars.append(
-                    SidecarSubtitle(prepared, sidecar.source, sidecar.language)
+                    SidecarSubtitle(
+                        prepared,
+                        sidecar.source,
+                        sidecar.language,
+                        align_with_reference=sidecar.align_with_reference,
+                        forced=sidecar.forced,
+                    )
                 )
                 continue
 
@@ -1158,7 +1164,13 @@ class MilksyncAdapter:
                     f"Sidecar synchronization did not create an output for {sidecar.path}"
                 )
             output_sidecars.append(
-                SidecarSubtitle(Path(synchronized), sidecar.source, sidecar.language)
+                SidecarSubtitle(
+                    Path(synchronized),
+                    sidecar.source,
+                    sidecar.language,
+                    align_with_reference=sidecar.align_with_reference,
+                    forced=sidecar.forced,
+                )
             )
         sync.sidecar_subtitles = output_sidecars
 

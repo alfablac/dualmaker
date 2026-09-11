@@ -147,6 +147,7 @@ CHOICES = {
     "dub_gap_fallback": {"original", "silence", "off"},
     "tvrip_fallback": {"ask", "original", "alternate-dub", "silence", "omit"},
     "subtitle_policy": {"prefer-master", "exact-union"},
+    "forced_dual_subtitle": {"first", "second"},
 }
 
 # The generated per-user config is intended to be edited directly. Keep its
@@ -168,6 +169,7 @@ CONFIG_SETTING_COMMENTS = {
     "dualmaker.audio_codec_preference": "Audio codec ranking from best to worst for automatic track selection.",
     "dualmaker.audio_selection_margin": "Score difference considered ambiguous rather than silently selecting a track.",
     "dualmaker.subtitle_policy": "prefer-master removes alternate DUAL subtitle slots; exact-union keeps non-identical tracks.",
+    "dualmaker.forced_dual_subtitle": "Mark the first or second Portuguese DUAL subtitle found as forced.",
     "dualmaker.sidecar_dual_language": "Default language for text sidecars named after the DUAL release.",
     "dualmaker.sidecar_language_overrides": "Per-sidecar PATH=LANGUAGE overrides; master sidecars normally require one.",
     "dualmaker.recap_window": "Opening seconds inspected for a one-sided recap before synchronization.",
@@ -346,14 +348,14 @@ def _convert_value(key: str, value: Any, *, base: Path, label: str) -> Any:
             return None if value is None else float(value)
     except (TypeError, ValueError) as exc:
         raise ConfigurationError(f"Invalid value for {label}: {value!r}") from exc
+    if value is None:
+        return None
     if key in CHOICES:
         normalized = str(value).strip().casefold()
         if normalized not in CHOICES[key]:
             choices = ", ".join(sorted(CHOICES[key]))
             raise ConfigurationError(f"{label} must be one of {choices}; received {value!r}")
         return normalized
-    if value is None:
-        return None
     return str(value)
 
 
@@ -404,6 +406,7 @@ def _default_config_document() -> dict[str, Any]:
             "audio_codec_preference": list(config.audio_codec_preference),
             "audio_selection_margin": config.audio_selection_margin,
             "subtitle_policy": config.subtitle_policy,
+            "forced_dual_subtitle": config.forced_dual_subtitle,
             "sidecar_language_overrides": list(config.sidecar_language_overrides),
             "sidecar_dual_language": config.sidecar_dual_language,
             "recap_window": config.recap_window,

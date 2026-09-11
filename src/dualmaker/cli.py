@@ -67,7 +67,12 @@ from .errors import (
 from .metadata import MediaInspector
 from .models import DualMakerConfig, JobResult, jsonable
 from .pipeline import plan_batch, plan_explicit, process_job
-from .reporting import archive_processed_inputs, build_report_summary, default_report_path, write_report
+from .reporting import (
+    archive_processed_inputs,
+    build_report_summary,
+    default_report_path,
+    write_report,
+)
 from .runner import ToolRunner, check_dependencies
 from .ui import TerminalUI
 
@@ -140,6 +145,7 @@ OPTION_GROUPS = {
         "audio_codec_preference",
         "audio_selection_margin",
         "subtitle_policy",
+        "forced_dual_subtitle",
         "sidecar_language_overrides",
         "sidecar_dual_language",
     },
@@ -444,6 +450,12 @@ def _exit_error(
         "Subtitle selection: prefer master per language/forced/SDH slot, or retain the "
         f"exact-deduplicated union (default: {DEFAULT_SUBTITLE_POLICY})."
     ),
+)
+@click.option(
+    "--forced-dual-subtitle",
+    type=click.Choice(["first", "second"]),
+    default=None,
+    help="Mark the first or second Portuguese DUAL subtitle found as forced.",
 )
 @click.option(
     "--sidecar-language",
@@ -980,6 +992,7 @@ def main(
     dub_gap_min_coverage: float | None,
     dub_gap_track_title: str | None,
     subtitle_policy: str | None,
+    forced_dual_subtitle: str | None,
     sidecar_language_overrides: tuple[str, ...],
     sidecar_dual_language: str | None,
     trim_recap: bool | None,
@@ -1172,6 +1185,7 @@ def main(
         "dub_gap_min_coverage": dub_gap_min_coverage,
         "dub_gap_track_title": dub_gap_track_title,
         "subtitle_policy": subtitle_policy,
+        "forced_dual_subtitle": forced_dual_subtitle,
         "sidecar_language_overrides": sidecar_language_overrides or None,
         "sidecar_dual_language": sidecar_dual_language,
         "trim_recap": trim_recap,

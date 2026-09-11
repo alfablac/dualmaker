@@ -339,7 +339,7 @@ def process_job(
                         == target_language
                     )
                 ]
-                for ocr_track in ocr_tracks:
+                for ocr_index, ocr_track in enumerate(ocr_tracks):
                     ocr_path = work_dir / f"ocr-track-{ocr_track.id}.srt"
                     try:
                         ocr_vobsub(
@@ -365,6 +365,17 @@ def process_job(
                                 "dual",
                                 normalize_language(ocr_track.effective_language),
                                 align_with_reference=False,
+                                forced=(
+                                    ocr_track.forced
+                                    or (
+                                        config.forced_dual_subtitle == "first"
+                                        and ocr_index == 0
+                                    )
+                                    or (
+                                        config.forced_dual_subtitle == "second"
+                                        and ocr_index == 1
+                                    )
+                                ),
                             )
                         )
         recap_report: dict[str, object] = {"enabled": config.trim_recap, "applied": False}

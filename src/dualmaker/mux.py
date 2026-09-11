@@ -854,6 +854,7 @@ def mux_output(
                 codec=sidecar.path.suffix.lstrip(".").upper(),
                 language=sidecar.language,
                 language_ietf=sidecar.language,
+                forced=sidecar.forced,
             ),
             Track(
                 0,
@@ -862,6 +863,7 @@ def mux_output(
                 codec=sidecar.path.suffix.lstrip(".").upper(),
                 language=sidecar.language,
                 language_ietf=sidecar.language,
+                forced=sidecar.forced,
             ),
             f"{sidecar.source}-sidecar",
             sync.timeline_adjustment_ms if sidecar.source == "dual" else None,
